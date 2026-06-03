@@ -1,0 +1,14 @@
+# Tells Grafana to load any dashboard JSON found in this folder on startup.
+apiVersion: 1
+
+providers:
+  - name: crypto-dashboards
+    orgId: 1
+    folder: Crypto                  # the Grafana folder dashboards appear under
+    type: file
+    disableDeletion: false
+    allowUiUpdates: true            # you can tweak in the UI; file still wins on restart
+    updateIntervalSeconds: 30       # re-scan this folder every 30s for changes
+    options:
+      path: /etc/grafana/provisioning/dashboards
+      foldersFromFilesStructure: false

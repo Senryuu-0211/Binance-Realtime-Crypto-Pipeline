@@ -1,0 +1,32 @@
+# --- Secrets / local config -------------------------------------------------
+# Never commit the real .env (it can hold credentials); commit .env.example only.
+.env
+*.env
+!.env.example
+.claude
+# --- Python -----------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Logs / runtime ---------------------------------------------------------
+*.log
+logs/
+
+# --- Editor / OS cruft ------------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+
+# --- Data dirs (only relevant if you switch named volumes to bind-mounts) ---
+clickhouse/data/
+grafana/data/
+redpanda/data/

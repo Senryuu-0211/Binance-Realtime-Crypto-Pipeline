@@ -1,0 +1,193 @@
+# =============================================================================
+# Real-Time Crypto Analytics Pipeline — Phase 1 (working skeleton)
+#
+# ONE file brings up the whole stack:
+#
+#   Binance WS  →  producer  →  Redpanda  →  consumer  →  ClickHouse  →  Grafana
+#
+# Design rule: everything builds/runs from THIS file on any machine.
+#   - producer/consumer are built from source (build:), never pulled pre-built.
+#   - no host-specific paths; only relative bind-mounts + named volumes.
+#   - so `git pull && docker compose up` behaves identically on dev & server.
+#
+# All tunables read from .env via ${VAR:-default}, so the stack also boots with
+# NO .env at all (sensible defaults baked in).
+# =============================================================================
+
+services:
+
+  # ---------------------------------------------------------------------------
+  # 1) Redpanda — the event log (Kafka API-compatible, single broker).
+  #    No ZooKeeper, no JVM — one Go/C++ binary. Perfect for single-node dev.
+  # ---------------------------------------------------------------------------
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    container_name: crypto-redpanda
+    command:
+      - redpanda
+      - start
+      # Two listeners:
+      #   internal  -> other containers connect via "redpanda:9092"
+      #   external  -> your dev machine connects via "localhost:19092"
+      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
+      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
+      # Inter-broker RPC (irrelevant for single node but required to be set).
+      - --rpc-addr=redpanda:33145
+      - --advertise-rpc-addr=redpanda:33145
+      # dev-container mode: relaxes fsync, overprovisioning, etc. for laptops.
+      - --mode=dev-container
+      - --smp=1
+      - --default-log-level=info
+      # Let the producer create the topic on first publish (no manual step).
+      - --set
+      - redpanda.auto_create_topics_enabled=true
+    ports:
+      - "19092:19092"   # external Kafka API (host -> broker, for debugging)
+      - "9644:9644"     # admin API / metrics
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      # Other services wait until the broker reports a healthy cluster.
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
+  # 2) Redpanda Console — web UI to WATCH messages flow through the topic.
+  #    Pure convenience for learning/debugging; not part of the data path.
+  #    Uses the official entrypoint trick to inject a tiny YAML config.
+  # ---------------------------------------------------------------------------
+  redpanda-console:
+    image: redpandadata/console:v2.7.2
+    container_name: crypto-redpanda-console
+    entrypoint: /bin/sh
+    command: -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml; /app/console'
+    environment:
+      CONFIG_FILEPATH: /tmp/config.yml
+      # $$ escapes $ so docker compose doesn't try to interpolate it.
+      CONSOLE_CONFIG_FILE: |
+        kafka:
+          brokers: ["redpanda:9092"]
+        redpanda:
+          adminApi:
+            enabled: true
+            urls: ["http://redpanda:9644"]
+    ports:
+      - "8080:8080"     # open http://localhost:8080 -> Topics -> trades
+    depends_on:
+      redpanda:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # 3) ClickHouse — columnar OLAP store for raw trades.
+  #    init/*.sql runs ONCE on first boot (empty data dir) to create the schema.
+  # ---------------------------------------------------------------------------
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    container_name: crypto-clickhouse
+    environment:
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-crypto}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      # Allow the default user to manage access (handy for a dev box).
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: 1
+    volumes:
+      # init SQL (read-only) -> auto-run on first start by the entrypoint.
+      - ./clickhouse/init:/docker-entrypoint-initdb.d:ro
+      - clickhouse_data:/var/lib/clickhouse
+    ports:
+      - "8123:8123"     # HTTP interface — used by the Python consumer
+      - "9000:9000"     # native protocol — used by the Grafana plugin
+    ulimits:
+      # ClickHouse opens many files; raise the limit or it complains loudly.
+      nofile:
+        soft: 262144
+        hard: 262144
+    healthcheck:
+      # /ping is an unauthenticated liveness endpoint — no credentials needed.
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:8123/ping || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+
+  # ---------------------------------------------------------------------------
+  # 4) Grafana — dashboards. Datasource + dashboard are provisioned AS CODE
+  #    (see grafana/provisioning), so the dashboard appears with zero clicks.
+  # ---------------------------------------------------------------------------
+  grafana:
+    image: grafana/grafana:11.2.0
+    container_name: crypto-grafana
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin}
+      # Auto-install the official ClickHouse datasource plugin on first boot.
+      # (Needs internet on the first `up`; resolves a version compatible with
+      #  this Grafana image. Pin a version here later if you want full lockdown.)
+      GF_INSTALL_PLUGINS: grafana-clickhouse-datasource
+      GF_USERS_DEFAULT_THEME: dark
+      # Passed through so the provisioned datasource YAML can reference them
+      # via ${VAR} interpolation (keeps credentials in one place: .env).
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-clickhouse}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-crypto}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"     # open http://localhost:3000  (admin / admin by default)
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # 5) Producer — Binance live trades -> Redpanda topic. Built from ./producer.
+  # ---------------------------------------------------------------------------
+  producer:
+    build: ./producer
+    container_name: crypto-producer
+    environment:
+      KAFKA_BROKER: ${KAFKA_BROKER:-redpanda:9092}
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-trades}
+      SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT}
+      BINANCE_WS_BASE: ${BINANCE_WS_BASE:-wss://stream.binance.com:9443}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # 6) Consumer — Redpanda -> batched insert -> ClickHouse. Built from ./consumer.
+  # ---------------------------------------------------------------------------
+  consumer:
+    build: ./consumer
+    container_name: crypto-consumer
+    environment:
+      KAFKA_BROKER: ${KAFKA_BROKER:-redpanda:9092}
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-trades}
+      KAFKA_GROUP_ID: ${KAFKA_GROUP_ID:-clickhouse-writer}
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-clickhouse}
+      CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-8123}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-crypto}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      CLICKHOUSE_TABLE: ${CLICKHOUSE_TABLE:-trades}
+      BATCH_SIZE: ${BATCH_SIZE:-1000}
+      FLUSH_INTERVAL_SECONDS: ${FLUSH_INTERVAL_SECONDS:-2}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+
+# Named volumes persist data across `docker compose down` (use `down -v` to wipe).
+volumes:
+  redpanda_data:
+  clickhouse_data:
+  grafana_data:

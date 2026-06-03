@@ -1,0 +1,10 @@
+# Pinned (no `latest`) so dev and server build byte-identical images.
+
+# Async WebSocket client. Auto-replies to Binance's server PING frames, so the
+# connection stays alive without us hand-rolling heartbeats.
+websockets==12.0
+
+# Kafka/Redpanda client. Wraps librdkafka (C) — fast and battle-tested.
+# producer.produce() is non-blocking (buffers + a background thread sends), so
+# it slots cleanly into our async loop without an async Kafka library.
+confluent-kafka==2.5.3

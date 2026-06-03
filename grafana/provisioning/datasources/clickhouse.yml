@@ -1,0 +1,23 @@
+# Grafana datasource AS CODE — provisioned on startup, no manual clicks.
+# Grafana substitutes ${VAR} from the container's environment (we pass the
+# CLICKHOUSE_* vars in docker-compose.yml).
+apiVersion: 1
+
+datasources:
+  - name: ClickHouse
+    type: grafana-clickhouse-datasource
+    uid: clickhouse                 # stable uid the dashboard JSON references
+    access: proxy                   # Grafana server talks to ClickHouse, not the browser
+    isDefault: true
+    jsonData:
+      host: ${CLICKHOUSE_HOST}
+      # NOTE: the plugin speaks ClickHouse's NATIVE protocol on 9000 — NOT the
+      # HTTP 8123 port the Python consumer uses. Different client, different port.
+      port: 9000
+      protocol: native
+      secure: false
+      username: ${CLICKHOUSE_USER}
+      defaultDatabase: ${CLICKHOUSE_DB}
+    secureJsonData:
+      password: ${CLICKHOUSE_PASSWORD}
+    editable: true
