@@ -29,4 +29,4 @@ Thumbs.db
 # --- Data dirs (only relevant if you switch named volumes to bind-mounts) ---
 clickhouse/data/
 grafana/data/
-redpanda/data/
+kafka/data/

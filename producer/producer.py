@@ -1,9 +1,9 @@
 """
-Producer: Binance live trades  ->  Redpanda topic.
+Producer: Binance live trades  ->  Kafka topic.
 
 What it does, end to end:
   1. Opens a WebSocket to Binance's public trade stream for the configured symbols.
-  2. For every trade tick, publishes a small JSON event to the Redpanda topic,
+  2. For every trade tick, publishes a small JSON event to the Kafka topic,
      keyed by symbol.
   3. Survives the disconnects Binance WILL throw at us (it caps connections at
      ~24h and drops sockets on any network blip) by reconnecting with backoff.
@@ -26,7 +26,7 @@ from confluent_kafka import Producer
 # ---------------------------------------------------------------------------
 # Configuration — all from environment (see .env / docker-compose.yml).
 # ---------------------------------------------------------------------------
-KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "redpanda:9092")
+KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "kafka:9092")
 KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "trades")
 BINANCE_WS_BASE = os.environ.get("BINANCE_WS_BASE", "wss://stream.binance.com:9443")
 SYMBOLS = [s.strip().upper() for s in os.environ.get("SYMBOLS", "BTCUSDT,ETHUSDT").split(",") if s.strip()]
@@ -149,7 +149,7 @@ async def connect_and_stream(producer: Producer, stop: asyncio.Event, state: dic
 
 
 def handle_message(producer: Producer, raw: str) -> None:
-    """Parse one Binance frame and forward the trade to Redpanda."""
+    """Parse one Binance frame and forward the trade to Kafka."""
     try:
         obj = json.loads(raw)
     except json.JSONDecodeError:

@@ -1,6 +1,6 @@
 # Pinned (no `latest`) so dev and server build byte-identical images.
 
-# Same Kafka/Redpanda client as the producer (wraps librdkafka, C).
+# Same Kafka client as the producer (wraps librdkafka, C).
 confluent-kafka==2.5.3
 
 # Official ClickHouse client (by ClickHouse Inc.). We use its column-oriented

@@ -1,13 +1,13 @@
-# Real-Time Crypto Analytics Pipeline — Phase 1
+# Real-Time Crypto Analytics Pipeline
 
-A working end-to-end stream: **Binance live trades → Redpanda → consumer →
+A working end-to-end stream: **Binance live trades → Kafka → consumer →
 ClickHouse → Grafana**. The whole thing comes up with **one `docker compose up`**
 on any machine — your dev box or the Ubuntu server — building everything from
 source. No pre-built images, no machine-specific paths.
 
-> **Phase 1 scope:** get the bytes flowing and visualized. Anomaly detection,
-> exactly-once delivery, and benchmarking are deliberately **out of scope** —
-> they come in later phases.
+> **Status:** Phase 1 (working skeleton) complete. **Phase 2 Part A** migrated the
+> event log from Redpanda to **real Apache Kafka in KRaft mode** (no ZooKeeper).
+> Anomaly detection, exactly-once delivery, and benchmarking come in later phases.
 
 ---
 
@@ -18,37 +18,40 @@ source. No pre-built images, no machine-specific paths.
                          │                  docker compose (one host)                 │
                          │                                                             │
   Binance public WS      │   ┌──────────┐      ┌────────────┐      ┌──────────────┐   │
- (wss trade streams) ───────▶│ producer │─────▶│  Redpanda  │─────▶│   consumer   │   │
-   btcusdt@trade         │   │ (Python) │ pub  │  topic:    │ sub  │  (Python)    │   │
-   ethusdt@trade         │   └──────────┘      │  "trades"  │      └──────┬───────┘   │
-                         │                     └─────┬──────┘   batched   │ insert    │
-                         │                           │          inserts   ▼           │
-                         │                    ┌──────▼──────┐      ┌──────────────┐   │
-                         │                    │  Redpanda   │      │  ClickHouse  │   │
-                         │                    │  Console    │      │  crypto.     │   │
-                         │                    │  :8080 (UI) │      │  trades      │   │
-                         │                    └─────────────┘      └──────┬───────┘   │
-                         │                                                │ native    │
-                         │                                         ┌──────▼───────┐   │
-                         │                                         │   Grafana    │   │
-                         │                                         │   :3000      │   │
-                         │                                         └──────────────┘   │
+ (wss trade streams) ───────▶│ producer │─────▶│   Kafka    │─────▶│   consumer   │   │
+   btcusdt@trade         │   │ (Python) │ pub  │  (KRaft)   │ sub  │  (Python)    │   │
+   ethusdt@trade         │   └──────────┘      │  topic:    │      └──────┬───────┘   │
+                         │                     │  "trades"  │     batched │ insert    │
+                         │                     └─────┬──────┘     inserts  ▼           │
+                         │                           │              ┌──────────────┐   │
+                         │                    ┌──────▼──────┐       │  ClickHouse  │   │
+                         │                    │  Kafka UI   │       │  crypto.     │   │
+                         │                    │  :8080 (UI) │       │  trades      │   │
+                         │                    └─────────────┘       └──────┬───────┘   │
+                         │                                                 │ native    │
+                         │                                          ┌──────▼───────┐   │
+                         │                                          │   Grafana    │   │
+                         │                                          │   :3000      │   │
+                         │                                          └──────────────┘   │
                          └───────────────────────────────────────────────────────────┘
 
-Data path:   producer → Redpanda → consumer → ClickHouse → Grafana
-Debug path:  Redpanda Console (:8080) watches the topic; not part of the data path.
+Data path:   producer → Kafka → consumer → ClickHouse → Grafana
+Debug path:  Kafka UI (:8080) watches the topic; not part of the data path.
+
+Kafka listeners:  containers → kafka:9092 (INTERNAL)   |   host → localhost:19092 (EXTERNAL)
 ```
 
 ### Components & key choices
 
 | Service | Image / Build | Why |
 |---|---|---|
-| **redpanda** | `redpandadata/redpanda` | Kafka-compatible event log, single binary (no ZooKeeper/JVM). One broker is plenty for single-node. |
-| **redpanda-console** | `redpandadata/console` | Web UI to *watch* messages flow — great for learning/debugging. |
+| **kafka** | `apache/kafka` (KRaft) | Industry-standard event-streaming backbone; strongest connector ecosystem (Kafka Connect, Schema Registry). KRaft = no ZooKeeper. Official Apache image, single broker for single-node. |
+| **kafka-init** | `apache/kafka` (one-shot) | Creates the `trades` topic with 3 partitions / RF 1, then exits. |
+| **kafka-ui** | `provectuslabs/kafka-ui` | Web UI to *watch* topics, messages, and consumer-group lag — great for learning/debugging. |
 | **clickhouse** | `clickhouse/clickhouse-server` | Columnar OLAP store; fast inserts + time-range scans. |
 | **grafana** | `grafana/grafana` | Dashboards, datasource + dashboard provisioned **as code**. |
-| **producer** | built from `./producer` | Binance WS → Redpanda. |
-| **consumer** | built from `./consumer` | Redpanda → batched insert → ClickHouse. |
+| **producer** | built from `./producer` | Binance WS → Kafka. |
+| **consumer** | built from `./consumer` | Kafka → batched insert → ClickHouse. |
 
 **Library choices (and why):**
 
@@ -63,19 +66,62 @@ Debug path:  Redpanda Console (:8080) watches the topic; not part of the data pa
 
 ---
 
+## Why Kafka, and how KRaft works
+
+**Why real Apache Kafka** (Phase 2 replaced Redpanda with it): Kafka is the
+industry-standard backbone for production event streaming, with by far the strongest
+connector ecosystem — Kafka Connect, Schema Registry, and a huge catalog of
+source/sink connectors. A real pipeline needs that integration surface. It's also what
+enterprise/industrial shops (the deployment target) actually run in production. The
+producer/consumer already spoke the Kafka protocol via `confluent-kafka`, so this was a
+**migration, not a rewrite**: only broker addresses and the broker service changed.
+
+**KRaft (Kafka Raft) — what replaced ZooKeeper.** Classic Kafka stored all cluster
+metadata (topics, partitions, leaders, ACLs, configs) in a *separate* ZooKeeper
+ensemble. KRaft moves that metadata into an internal Kafka log managed by **controller**
+nodes using the Raft consensus protocol — so there's one fewer system to run, operate,
+and fail. It's the modern, default architecture (ZooKeeper mode is removed in Kafka 4.x).
+
+- **Controller quorum** = the set of controller nodes that vote to elect the leader of
+  the metadata log (`KAFKA_CONTROLLER_QUORUM_VOTERS=1@kafka:9093`). Here one node is the
+  whole quorum. In a real multi-machine cluster you'd run 3 controllers so the metadata
+  log survives losing one.
+- **Combined mode**: our single node runs **both** roles — `controller` (owns metadata)
+  and `broker` (stores partitions, serves traffic) — via
+  `KAFKA_PROCESS_ROLES=broker,controller`. Fine for single-node; large clusters separate
+  the roles.
+- **Single broker is honest for one host.** Running 3 brokers on one machine gives **no
+  real fault tolerance** — they share the same disk, kernel, and power. So we run one
+  broker and set every replication factor to **1** (you can't replicate to brokers that
+  don't exist).
+
+**Advertised listeners — the #1 Kafka-in-Docker gotcha.** A client connects to a
+*bootstrap* address, and Kafka replies with the **advertised** address to use for the
+actual partition leader. If that advertised address is wrong, the first handshake
+"works" but every produce/fetch afterwards fails. We expose two client listeners with
+different advertised names so both audiences get a reachable address:
+
+| Listener | Port | Advertised as | Who uses it |
+|---|---|---|---|
+| `INTERNAL` | 9092 | `kafka:9092` | other containers (producer, consumer, kafka-ui) |
+| `EXTERNAL` | 19092 | `localhost:19092` | your host / dev box |
+| `CONTROLLER` | 9093 | *(not advertised)* | internal Raft metadata traffic only |
+
+---
+
 ## Project layout
 
 ```
 .
-├── docker-compose.yml          # the single orchestrator (6 services)
+├── docker-compose.yml          # the single orchestrator (7 services)
 ├── .env.example                # documented config template (copy to .env)
 ├── .gitignore
-├── Makefile                    # up / down / logs / ps / query / clean
-├── producer/                   # Binance WS → Redpanda
+├── Makefile                    # up / down / logs / ps / topic / query / clean
+├── producer/                   # Binance WS → Kafka
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── producer.py
-├── consumer/                   # Redpanda → ClickHouse (batched)
+├── consumer/                   # Kafka → ClickHouse (batched)
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── consumer.py
@@ -114,7 +160,7 @@ Then open:
 | URL | What |
 |---|---|
 | http://localhost:3000 | **Grafana** → dashboard **Crypto Live** (login `admin` / `admin`) |
-| http://localhost:8080 | **Redpanda Console** → topic `trades`, watch messages |
+| http://localhost:8080 | **Kafka UI** → cluster `crypto-local` → topic `trades`, watch messages |
 
 Useful commands:
 
@@ -153,7 +199,7 @@ make up                         # rebuilds changed images and restarts
 ```
 
 `restart: unless-stopped` keeps producer/consumer alive across reboots. Named
-volumes (`redpanda_data`, `clickhouse_data`, `grafana_data`) persist data across
+volumes (`kafka_data`, `clickhouse_data`, `grafana_data`) persist data across
 `make down`; use `make clean` only when you want a clean slate.
 
 ---
@@ -167,7 +213,7 @@ defaults below if a var is unset, so the stack also boots with no `.env`.
 |---|---|---|
 | `SYMBOLS` | `BTCUSDT,ETHUSDT` | Comma-separated Binance symbols to stream. |
 | `BINANCE_WS_BASE` | `wss://stream.binance.com:9443` | Binance market-stream base URL. |
-| `KAFKA_BROKER` | `redpanda:9092` | Broker address used **inside** the network (host: `localhost:19092`). |
+| `KAFKA_BROKER` | `kafka:9092` | Broker address used **inside** the network (INTERNAL listener; host uses `localhost:19092`). |
 | `KAFKA_TOPIC` | `trades` | Topic the producer writes and consumer reads. |
 | `KAFKA_GROUP_ID` | `clickhouse-writer` | Consumer group (offsets tracked per group). |
 | `CLICKHOUSE_HOST` | `clickhouse` | ClickHouse hostname on the compose network. |
@@ -228,7 +274,8 @@ phase).
 
 1. `make ps` → all services `running` / `healthy`.
 2. **Producer:** `make logs-producer` shows `connected; streaming BTCUSDT,ETHUSDT`.
-3. **Topic:** open Redpanda Console (http://localhost:8080) → `trades` → live messages keyed by symbol.
+3. **Topic:** open Kafka UI (http://localhost:8080) → cluster `crypto-local` → topic `trades`
+   → 3 partitions, live messages keyed by symbol (and check the consumer group's lag near 0).
 4. **ClickHouse:** `make query` → row counts climbing, a realistic `last_price`.
 5. **Grafana:** http://localhost:3000 → **Crypto Live** → price line moving, current-price stat updating.
 6. **Reconnect:** `docker compose restart producer` → logs show backoff → reconnect → data resumes.
@@ -237,6 +284,13 @@ phase).
 
 ## Troubleshooting
 
+- **Producer/consumer can't reach the broker (timeouts, "broker transport failure"):**
+  almost always advertised listeners. Containers must use `kafka:9092` (INTERNAL); only
+  the host uses `localhost:19092` (EXTERNAL). Check `docker compose logs kafka` and the
+  `KAFKA_ADVERTISED_LISTENERS` value.
+- **`kafka-init` failed / topic missing:** check `docker compose logs kafka-init`. It's a
+  one-shot that creates `trades` (3 partitions, RF 1); rerun with `make topic` or
+  `docker compose up kafka-init`.
 - **Grafana datasource error / plugin missing:** the first `up` needs internet to
   install `grafana-clickhouse-datasource`. Check `docker compose logs grafana`.
 - **Dashboard empty:** give it a minute (data must accumulate); confirm `make query`

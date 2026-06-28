@@ -1,9 +1,13 @@
 # =============================================================================
-# Real-Time Crypto Analytics Pipeline — Phase 1 (working skeleton)
+# Real-Time Crypto Analytics Pipeline — Phase 2 (Kafka KRaft)
 #
 # ONE file brings up the whole stack:
 #
-#   Binance WS  →  producer  →  Redpanda  →  consumer  →  ClickHouse  →  Grafana
+#   Binance WS  →  producer  →  Kafka  →  consumer  →  ClickHouse  →  Grafana
+#
+# Phase 2 Part A migrated the event log from Redpanda to real Apache Kafka in
+# KRaft mode (no ZooKeeper). The producer/consumer speak the Kafka protocol via
+# confluent-kafka, so only broker addresses changed — the app logic is untouched.
 #
 # Design rule: everything builds/runs from THIS file on any machine.
 #   - producer/consumer are built from source (build:), never pulled pre-built.
@@ -17,71 +21,149 @@
 services:
 
   # ---------------------------------------------------------------------------
-  # 1) Redpanda — the event log (Kafka API-compatible, single broker).
-  #    No ZooKeeper, no JVM — one Go/C++ binary. Perfect for single-node dev.
+  # 1) Apache Kafka — the event log, running in KRaft mode (NO ZooKeeper).
+  #
+  #    KRaft (Kafka Raft) replaces ZooKeeper with a Raft consensus quorum that
+  #    lives INSIDE Kafka. Cluster metadata (topics, partitions, leaders, ACLs)
+  #    used to be stored in a separate ZooKeeper ensemble; now it lives in an
+  #    internal Kafka metadata log managed by "controller" nodes. Fewer moving
+  #    parts, faster failover, and the only supported mode in modern Kafka (4.x).
+  #
+  #    SINGLE BROKER is the correct choice for a single host. Running 3 broker
+  #    containers on ONE machine gives you NO real fault tolerance: they share
+  #    the same disk, kernel, and power — if the host dies, all 3 die together.
+  #    Real HA needs separate physical machines. So we run one broker honestly,
+  #    which forces replication-factor = 1 everywhere (see below).
   # ---------------------------------------------------------------------------
-  redpanda:
-    image: redpandadata/redpanda:v24.2.7
-    container_name: crypto-redpanda
-    command:
-      - redpanda
-      - start
-      # Two listeners:
-      #   internal  -> other containers connect via "redpanda:9092"
-      #   external  -> your dev machine connects via "localhost:19092"
-      - --kafka-addr=internal://0.0.0.0:9092,external://0.0.0.0:19092
-      - --advertise-kafka-addr=internal://redpanda:9092,external://localhost:19092
-      # Inter-broker RPC (irrelevant for single node but required to be set).
-      - --rpc-addr=redpanda:33145
-      - --advertise-rpc-addr=redpanda:33145
-      # dev-container mode: relaxes fsync, overprovisioning, etc. for laptops.
-      - --mode=dev-container
-      - --smp=1
-      - --default-log-level=info
-      # Let the producer create the topic on first publish (no manual step).
-      - --set
-      - redpanda.auto_create_topics_enabled=true
+  kafka:
+    image: apache/kafka:3.8.1            # official Apache image, KRaft-native, minimal
+    container_name: crypto-kafka
+    environment:
+      # --- KRaft identity & roles ------------------------------------------
+      # This one node plays BOTH roles ("combined mode"):
+      #   controller -> owns cluster metadata (the job ZooKeeper used to do)
+      #   broker     -> stores partitions, serves produce/fetch
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      # The controller quorum = the voters that elect the metadata leader.
+      # Format <nodeId>@<host>:<port>. One voter here = this single node.
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+
+      # --- Listeners (THE #1 thing people get wrong with Kafka in Docker) ---
+      # How Kafka connects: a client hits a bootstrap address, then the broker
+      # replies with the ADVERTISED address to use for the real partition
+      # leader. If the advertised address is wrong, the first connect "works"
+      # but every produce/fetch afterwards hangs or fails. So we expose TWO
+      # client listeners with DIFFERENT advertised names:
+      #   INTERNAL  (9092)  -> other CONTAINERS    -> advertised as kafka:9092
+      #   EXTERNAL  (19092) -> your HOST / dev box -> advertised as localhost:19092
+      #   CONTROLLER(9093)  -> internal Raft only  -> never advertised to clients
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: CONTROLLER:PLAINTEXT,INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093,EXTERNAL://0.0.0.0:19092
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:9092,EXTERNAL://localhost:19092
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+
+      # --- Single-node sanity: replication factor MUST be 1 -----------------
+      # Kafka's internal topics (__consumer_offsets, transaction log) default to
+      # RF=3 and would FAIL to create on a one-broker cluster. Force them to 1.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # New consumer groups rebalance immediately instead of waiting to batch joins.
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      # Default partitions for any auto-created topic (we also create 'trades'
+      # explicitly in kafka-init below, so this is just a safety default).
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+      # Persist the log (and committed offsets) on the named volume below.
+      KAFKA_LOG_DIRS: /var/lib/kafka/data
     ports:
-      - "19092:19092"   # external Kafka API (host -> broker, for debugging)
-      - "9644:9644"     # admin API / metrics
+      - "19092:19092"   # EXTERNAL listener: host -> broker (connect to localhost:19092)
     volumes:
-      - redpanda_data:/var/lib/redpanda/data
+      - kafka_data:/var/lib/kafka/data
     healthcheck:
-      # Other services wait until the broker reports a healthy cluster.
-      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      # Ready once the broker answers an API-versions request on its internal port.
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1 || exit 1"]
       interval: 10s
       timeout: 5s
-      retries: 12
+      retries: 15
       start_period: 20s
 
   # ---------------------------------------------------------------------------
-  # 2) Redpanda Console — web UI to WATCH messages flow through the topic.
-  #    Pure convenience for learning/debugging; not part of the data path.
-  #    Uses the official entrypoint trick to inject a tiny YAML config.
+  # 2) kafka-init — one-shot: create the 'trades' topic explicitly, then exit.
+  #
+  #    PARTITION COUNT = 3. Partitions are Kafka's unit of consumer parallelism:
+  #    within a consumer group, each partition is read by AT MOST one instance,
+  #    so a 1-partition topic caps you at ONE consumer instance forever (no
+  #    horizontal scaling). 3 partitions lets us scale the consumer to up to 3
+  #    instances later and spreads I/O, while staying cheap on a single broker.
+  #    REPLICATION FACTOR = 1 because there is only one broker to hold a copy.
   # ---------------------------------------------------------------------------
-  redpanda-console:
-    image: redpandadata/console:v2.7.2
-    container_name: crypto-redpanda-console
-    entrypoint: /bin/sh
-    command: -c 'echo "$$CONSOLE_CONFIG_FILE" > /tmp/config.yml; /app/console'
+  kafka-init:
+    image: apache/kafka:3.8.1
+    container_name: crypto-kafka-init
+    depends_on:
+      kafka:
+        condition: service_healthy
+    # Override the image's Kafka entrypoint with a shell script.
+    #
+    # IMPORTANT: `command` MUST be a LIST whose single element is the WHOLE
+    # script. If you pass it as a plain string, Compose splits it on spaces and
+    # only the first token reaches `sh -c` as the program to run (the rest
+    # become $0, $1, …) — so kafka-topics runs with NO arguments and just prints
+    # its usage/help, exiting 1. (That was the earlier failure: the kafka-topics
+    # syntax was correct; the shell wiring wasn't.)
+    #
+    # Inside the script, shell `$` must be written `$$` so Compose doesn't try to
+    # interpolate it; `${KAFKA_TOPIC:-trades}` is left as a single `$` ON PURPOSE
+    # so Compose substitutes the topic name at parse time.
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -e
+        # Readiness wait: a broker can report "healthy" a moment before it fully
+        # accepts client API calls, so retry --list until it answers (or give up).
+        # This removes the race even if the healthcheck flips early.
+        n=0
+        until /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 --list >/dev/null 2>&1; do
+          n=$$((n + 1))
+          if [ $$n -gt 30 ]; then
+            echo "kafka not reachable after 30 attempts — giving up"; exit 1
+          fi
+          echo "waiting for kafka to accept connections ($$n/30)..."; sleep 2
+        done
+        echo "kafka is up; creating topic '${KAFKA_TOPIC:-trades}'"
+        # Correct Kafka 3.8 (KRaft) syntax: --bootstrap-server, NEVER --zookeeper.
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+          --create --if-not-exists \
+          --topic ${KAFKA_TOPIC:-trades} \
+          --partitions 3 --replication-factor 1
+        /opt/kafka/bin/kafka-topics.sh --bootstrap-server kafka:9092 \
+          --describe --topic ${KAFKA_TOPIC:-trades}
+    restart: "no"
+
+  # ---------------------------------------------------------------------------
+  # 3) Kafka UI — web UI to WATCH topics, messages, and consumer-group lag.
+  #    (Provectus kafka-ui — works with plain Kafka over the standard protocol;
+  #    pinned to v0.7.2. The actively-maintained successor is kafbat/kafka-ui if
+  #    you ever want to bump it.) Purely for learning/debugging, not data path.
+  # ---------------------------------------------------------------------------
+  kafka-ui:
+    image: provectuslabs/kafka-ui:v0.7.2
+    container_name: crypto-kafka-ui
     environment:
-      CONFIG_FILEPATH: /tmp/config.yml
-      # $$ escapes $ so docker compose doesn't try to interpolate it.
-      CONSOLE_CONFIG_FILE: |
-        kafka:
-          brokers: ["redpanda:9092"]
-        redpanda:
-          adminApi:
-            enabled: true
-            urls: ["http://redpanda:9644"]
+      KAFKA_CLUSTERS_0_NAME: crypto-local
+      KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      DYNAMIC_CONFIG_ENABLED: "true"
     ports:
       - "8080:8080"     # open http://localhost:8080 -> Topics -> trades
     depends_on:
-      redpanda:
+      kafka:
         condition: service_healthy
 
   # ---------------------------------------------------------------------------
-  # 3) ClickHouse — columnar OLAP store for raw trades.
+  # 4) ClickHouse — columnar OLAP store for raw trades.
   #    init/*.sql runs ONCE on first boot (empty data dir) to create the schema.
   # ---------------------------------------------------------------------------
   clickhouse:
@@ -114,7 +196,7 @@ services:
       start_period: 15s
 
   # ---------------------------------------------------------------------------
-  # 4) Grafana — dashboards. Datasource + dashboard are provisioned AS CODE
+  # 5) Grafana — dashboards. Datasource + dashboard are provisioned AS CODE
   #    (see grafana/provisioning), so the dashboard appears with zero clicks.
   # ---------------------------------------------------------------------------
   grafana:
@@ -144,30 +226,32 @@ services:
         condition: service_healthy
 
   # ---------------------------------------------------------------------------
-  # 5) Producer — Binance live trades -> Redpanda topic. Built from ./producer.
+  # 6) Producer — Binance live trades -> Kafka topic. Built from ./producer.
   # ---------------------------------------------------------------------------
   producer:
     build: ./producer
     container_name: crypto-producer
     environment:
-      KAFKA_BROKER: ${KAFKA_BROKER:-redpanda:9092}
+      KAFKA_BROKER: ${KAFKA_BROKER:-kafka:9092}
       KAFKA_TOPIC: ${KAFKA_TOPIC:-trades}
       SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT}
       BINANCE_WS_BASE: ${BINANCE_WS_BASE:-wss://stream.binance.com:9443}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
-      redpanda:
+      kafka:
         condition: service_healthy
+      kafka-init:                       # wait until the 'trades' topic exists
+        condition: service_completed_successfully
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
-  # 6) Consumer — Redpanda -> batched insert -> ClickHouse. Built from ./consumer.
+  # 7) Consumer — Kafka -> batched insert -> ClickHouse. Built from ./consumer.
   # ---------------------------------------------------------------------------
   consumer:
     build: ./consumer
     container_name: crypto-consumer
     environment:
-      KAFKA_BROKER: ${KAFKA_BROKER:-redpanda:9092}
+      KAFKA_BROKER: ${KAFKA_BROKER:-kafka:9092}
       KAFKA_TOPIC: ${KAFKA_TOPIC:-trades}
       KAFKA_GROUP_ID: ${KAFKA_GROUP_ID:-clickhouse-writer}
       CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-clickhouse}
@@ -180,14 +264,16 @@ services:
       FLUSH_INTERVAL_SECONDS: ${FLUSH_INTERVAL_SECONDS:-2}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
-      redpanda:
+      kafka:
         condition: service_healthy
+      kafka-init:
+        condition: service_completed_successfully
       clickhouse:
         condition: service_healthy
     restart: unless-stopped
 
 # Named volumes persist data across `docker compose down` (use `down -v` to wipe).
 volumes:
-  redpanda_data:
+  kafka_data:
   clickhouse_data:
   grafana_data:

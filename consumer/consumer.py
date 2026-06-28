@@ -1,5 +1,5 @@
 """
-Consumer: Redpanda topic  ->  (batched)  ->  ClickHouse.
+Consumer: Kafka topic  ->  (batched)  ->  ClickHouse.
 
 The one idea to absorb here is WHY WE BATCH.
 
@@ -33,7 +33,7 @@ from confluent_kafka import Consumer
 # ---------------------------------------------------------------------------
 # Configuration — all from environment (see .env / docker-compose.yml).
 # ---------------------------------------------------------------------------
-KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "redpanda:9092")
+KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "kafka:9092")
 KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "trades")
 KAFKA_GROUP_ID = os.environ.get("KAFKA_GROUP_ID", "clickhouse-writer")
 

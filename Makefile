@@ -38,8 +38,9 @@ ps:              ## Show service status / health
 build:           ## Rebuild producer/consumer images without starting
 	$(COMPOSE) build
 
-topic:           ## Describe the trades topic (creates it implicitly if missing)
-	$(COMPOSE) exec redpanda rpk topic describe $${KAFKA_TOPIC:-trades}
+topic:           ## Describe the trades topic (partitions, replicas, offsets)
+	$(COMPOSE) exec kafka /opt/kafka/bin/kafka-topics.sh \
+		--bootstrap-server kafka:9092 --describe --topic $${KAFKA_TOPIC:-trades}
 
 query:           ## Quick sanity check: row counts + latest price per symbol
 	$(COMPOSE) exec clickhouse clickhouse-client --query \
