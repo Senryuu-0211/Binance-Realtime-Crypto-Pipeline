@@ -62,7 +62,7 @@ ORDER BY symbol
 DDL_MV = f"""
 CREATE MATERIALIZED VIEW IF NOT EXISTS {CLICKHOUSE_DB}.peak_prices_mv
 TO {CLICKHOUSE_DB}.peak_prices
-AS SELECT symbol, maxState(price) AS peak_state
+AS SELECT symbol, maxState(toFloat64(price)) AS peak_state
 FROM {CLICKHOUSE_DB}.trades
 GROUP BY symbol
 """

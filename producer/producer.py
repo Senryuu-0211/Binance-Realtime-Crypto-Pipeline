@@ -80,9 +80,15 @@ def make_producer() -> Producer:
     })
 
 
-def publish(producer: Producer, symbol: str, price: float, quantity: float, trade_time_ms: int) -> None:
+def publish(producer: Producer, symbol: str, trade_id: int, price: str, quantity: str, trade_time_ms: int) -> None:
     """Queue one trade event. Keyed by symbol so all of a symbol's trades land
     on the same partition (preserves per-symbol ordering).
+
+    price/quantity are forwarded as the RAW STRINGS Binance sent (e.g.
+    "64123.45000000"), NOT floats. JSON has no decimal type, so a float here
+    would already lose precision before the consumer can build a Decimal. We
+    keep them exact end-to-end by passing the strings through.
+    trade_id (Binance field "t") rides along as the dedup key.
 
     produce() is NON-BLOCKING: it copies the record into librdkafka's internal
     queue and returns. A background thread does the actual sending. If that
@@ -90,8 +96,9 @@ def publish(producer: Producer, symbol: str, price: float, quantity: float, trad
     """
     payload = json.dumps({
         "symbol": symbol,
-        "price": price,
-        "quantity": quantity,
+        "trade_id": trade_id,          # Binance "t" — dedup key downstream
+        "price": price,                # raw string, e.g. "64123.45000000"
+        "quantity": quantity,          # raw string
         "trade_time": trade_time_ms,   # epoch milliseconds, as Binance sends it
     })
     while True:
@@ -165,8 +172,9 @@ def handle_message(producer: Producer, raw: str) -> None:
         publish(
             producer,
             symbol=data["s"],
-            price=float(data["p"]),
-            quantity=float(data["q"]),
+            trade_id=int(data["t"]),       # Binance trade id (dedup key)
+            price=str(data["p"]),          # keep exact string (Decimal later)
+            quantity=str(data["q"]),
             trade_time_ms=int(data["T"]),
         )
     except (KeyError, ValueError) as exc:

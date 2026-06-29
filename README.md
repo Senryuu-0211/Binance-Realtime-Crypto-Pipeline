@@ -5,11 +5,10 @@ ClickHouse → Grafana**. The whole thing comes up with **one `docker compose up
 on any machine — your dev box or the Ubuntu server — building everything from
 source. No pre-built images, no machine-specific paths.
 
-> **Status:** Phases 1 & 2 complete. Phase 2 migrated the event log from Redpanda to
-> **real Apache Kafka in KRaft mode** (no ZooKeeper), added **all-time peak tracking**
-> with a Grafana gauge ("% of all-time high"), and a **rolling moving-average** trend line
-> per symbol. Next: **Phase 3 — exactly-once** delivery. (Anomaly detection and
-> benchmarking come after that.)
+> **Status:** Phases 1 & 2 complete (Kafka KRaft, all-time peak gauge, rolling
+> moving-average). **Phase 3 (in progress)** makes ingestion **idempotent / effectively-once**:
+> `trade_id` dedup key + `ReplacingMergeTree`, and `Decimal64(8)` money. Next within Phase 3:
+> producer idempotence; then anomaly detection and benchmarking.
 
 ---
 
@@ -341,10 +340,11 @@ See [consumer/consumer.py](consumer/consumer.py).
 ### 2. Why these ClickHouse types
 See [clickhouse/init/01_schema.sql](clickhouse/init/01_schema.sql).
 - `symbol LowCardinality(String)` — only a few distinct values → dictionary-encoded, smaller & faster.
-- `price/quantity Float64` — simple for a viz skeleton (Binance sends strings; we parse to float). Swap to `Decimal64(8)` later for exact money math.
+- `trade_id UInt64` — Binance's per-symbol trade id (field `t`); the **dedup key** (Phase 3).
+- `price/quantity Decimal64(8)` — exact money to Binance's 8 dp (Phase 3, was Float64). Parsed from the raw string, never via float.
 - `trade_time DateTime64(3)` — Binance trade time is **epoch milliseconds**, so millisecond precision.
-- `ingested_at … DEFAULT now64(3)` — set by ClickHouse on insert; later lets us measure end-to-end lag.
-- `ORDER BY (symbol, trade_time)` — the sparse primary index, matching "price of symbol X over a time range".
+- `ingested_at … DEFAULT now64(3)` — set by ClickHouse on insert; doubles as the **ReplacingMergeTree version**.
+- `ENGINE = ReplacingMergeTree(ingested_at)`, `ORDER BY (symbol, trade_id)` — collapses duplicate `(symbol, trade_id)` rows at merge time. Day-`PARTITION` still prunes time-range scans.
 
 ### 3. How the WebSocket reconnect works
 Binance **will** drop the socket (~24h connection cap, plus transient blips), so the
@@ -357,11 +357,24 @@ producer treats disconnects as routine. See [producer/producer.py](producer/prod
   (which is what keeps us connected), and a **receive timeout** detects a silently dead
   socket and forces a reconnect.
 
-### Delivery semantics
-**At-least-once.** The consumer disables auto-commit and commits Kafka offsets *only
-after* a batch lands in ClickHouse. A crash mid-batch means those messages are re-read
-on restart (a few possible duplicate rows — fine for Phase 1; exactly-once is a later
-phase).
+### Delivery semantics — effectively-once via idempotent writes (Phase 3)
+Kafka delivery stays **at-least-once**: the consumer disables auto-commit and commits
+offsets *only after* a batch lands in ClickHouse, so a crash mid-batch makes it re-read
+and **re-insert** those messages. True distributed exactly-once is near-impossible, so
+instead we make the **write idempotent** — reprocessing the same trades yields the same
+final result (*effectively-once*):
+
+- Each trade carries Binance's **`trade_id`** (field `t`), unique per symbol.
+- `crypto.trades` is **`ReplacingMergeTree(ingested_at)`** with `ORDER BY (symbol, trade_id)`.
+  Rows sharing `(symbol, trade_id)` collapse to one (highest `ingested_at`) at merge time.
+- **⚠️ Dedup is at MERGE time (background), not on insert.** Until parts merge, duplicates
+  coexist: `SELECT count()` may over-count; **`SELECT count() … FINAL`** (or a re-aggregating
+  `GROUP BY`) is dedup-correct. Force it now with `OPTIMIZE TABLE crypto.trades FINAL`.
+- **Money is `Decimal64(8)`**, not Float64 — exact to Binance's 8 dp. The producer forwards
+  the raw price **string**, the consumer parses it straight into `Decimal` (no float between).
+- **Peak still works:** the peak MV runs at *insert* time (before dedup), so it sees a
+  reprocessed trade twice — but `max(x, x) = x`, so duplicates can't change the peak. (This
+  is safe for `max` only; `sum`/`count` would over-count and need `FINAL` input.)
 
 ---
 

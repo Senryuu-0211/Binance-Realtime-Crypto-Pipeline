@@ -26,6 +26,7 @@ import signal
 import sys
 import time
 from datetime import datetime, timezone
+from decimal import Decimal, InvalidOperation
 
 import clickhouse_connect
 from confluent_kafka import Consumer
@@ -49,8 +50,8 @@ FLUSH_INTERVAL_SECONDS = float(os.environ.get("FLUSH_INTERVAL_SECONDS", "2"))
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
 
 # Columns we write. ingested_at is intentionally omitted — ClickHouse fills it
-# from the table's DEFAULT now64(3) at insert time.
-COLUMNS = ["symbol", "price", "quantity", "trade_time"]
+# from the table's DEFAULT now64(3) at insert time (it's also the dedup version).
+COLUMNS = ["symbol", "trade_id", "price", "quantity", "trade_time"]
 
 # Safety net: mirrors clickhouse/init/01_schema.sql. The init script is the
 # source of truth, but running this idempotent DDL on startup means the
@@ -60,14 +61,15 @@ DDL_TABLE = f"""
 CREATE TABLE IF NOT EXISTS {CLICKHOUSE_DB}.{CLICKHOUSE_TABLE}
 (
     symbol       LowCardinality(String),
-    price        Float64,
-    quantity     Float64,
+    trade_id     UInt64,
+    price        Decimal64(8),
+    quantity     Decimal64(8),
     trade_time   DateTime64(3, 'UTC'),
     ingested_at  DateTime64(3, 'UTC') DEFAULT now64(3)
 )
-ENGINE = MergeTree
+ENGINE = ReplacingMergeTree(ingested_at)
 PARTITION BY toYYYYMMDD(trade_time)
-ORDER BY (symbol, trade_time)
+ORDER BY (symbol, trade_id)
 """
 
 logging.basicConfig(level=LOG_LEVEL, format="%(asctime)s %(levelname)s [consumer] %(message)s")
@@ -107,15 +109,18 @@ def connect_clickhouse():
 def parse_message(value: bytes):
     """Turn one Kafka message into a ClickHouse row, or None if unusable.
 
-    The producer sends: {"symbol","price","quantity","trade_time"(epoch ms)}.
-    We convert trade_time ms -> a tz-aware datetime so clickhouse-connect maps
-    it correctly onto DateTime64(3); passing a raw int would be read as seconds.
+    The producer sends: {"symbol","trade_id","price"(str),"quantity"(str),"trade_time"(epoch ms)}.
+    - trade_id -> int (the dedup key, UInt64 column).
+    - price/quantity -> Decimal built straight from Binance's STRING, so no float
+      ever touches the value (exact money into the Decimal64(8) columns).
+    - trade_time ms -> tz-aware datetime so clickhouse-connect maps it onto
+      DateTime64(3); a raw int would be read as seconds.
     """
     try:
         d = json.loads(value)
         trade_time = datetime.fromtimestamp(d["trade_time"] / 1000.0, tz=timezone.utc)
-        return [str(d["symbol"]), float(d["price"]), float(d["quantity"]), trade_time]
-    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+        return [str(d["symbol"]), int(d["trade_id"]), Decimal(d["price"]), Decimal(d["quantity"]), trade_time]
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError, InvalidOperation) as exc:
         log.warning("dropping bad message: %s", exc)
         return None
 

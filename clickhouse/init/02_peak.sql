@@ -58,9 +58,20 @@ TO crypto.peak_prices                 -- write results into the table above
 AS
 SELECT
     symbol,
-    maxState(price) AS peak_state     -- partial max state for THIS inserted block
+    -- toFloat64: trades.price is Decimal64(8) (Phase 3), but peak_state is a
+    -- max(Float64) state. The peak is a display metric for the "% of ATH" gauge,
+    -- where Float64 is plenty — so we cast here and leave peak_prices / the
+    -- seeder / the gauges all Float64 (no cascade of changes).
+    maxState(toFloat64(price)) AS peak_state   -- partial max for THIS inserted block
 FROM crypto.trades
 GROUP BY symbol;
+
+-- ⚠️ PHASE 3 INTERACTION — the MV runs at INSERT time, BEFORE ReplacingMergeTree
+-- dedups (which happens at MERGE time). So if a trade is processed twice, the MV
+-- sees its price TWICE. For max() that is HARMLESS: max(x, x) = x — a duplicate
+-- can't change the maximum. This is exactly why peak survives at-least-once /
+-- reprocessing unchanged. It would NOT be safe for sum()/count()/avg(), where a
+-- duplicate inflates the result — those would need dedup-correct input (FINAL).
 
 -- ---------------------------------------------------------------------------
 -- ⚠️ READING THE PEAK — the #1 trap with AggregatingMergeTree:

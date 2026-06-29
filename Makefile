@@ -8,7 +8,7 @@
 # Use the v2 plugin syntax (`docker compose`, not the old `docker-compose`).
 COMPOSE := docker compose
 
-.PHONY: help up down restart logs logs-producer logs-consumer ps build topic query seed-peaks peaks clean
+.PHONY: help up down restart logs logs-producer logs-consumer ps build topic query seed-peaks peaks dedup-check clean
 
 help:            ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -52,6 +52,13 @@ seed-peaks:      ## Seed all-time peak prices from Binance klines (idempotent, o
 peaks:           ## Show seeded/maintained all-time peak per symbol (correct maxMerge read)
 	$(COMPOSE) exec clickhouse clickhouse-client --query \
 		"SELECT symbol, maxMerge(peak_state) AS all_time_peak FROM crypto.peak_prices GROUP BY symbol ORDER BY symbol"
+
+dedup-check:     ## Raw count (may include dups) vs FINAL count (dedup'd) per symbol
+	$(COMPOSE) exec clickhouse clickhouse-client --query \
+		"SELECT symbol, count() AS raw_rows, uniqExact(trade_id) AS unique_trades FROM crypto.trades GROUP BY symbol ORDER BY symbol"
+	@echo "-- after dedup (FINAL): --"
+	$(COMPOSE) exec clickhouse clickhouse-client --query \
+		"SELECT symbol, count() AS final_rows FROM crypto.trades FINAL GROUP BY symbol ORDER BY symbol"
 
 clean:           ## Stop everything AND delete data volumes (full reset)
 	$(COMPOSE) down -v
