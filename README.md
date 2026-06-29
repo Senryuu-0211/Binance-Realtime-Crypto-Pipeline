@@ -376,6 +376,14 @@ final result (*effectively-once*):
   reprocessed trade twice — but `max(x, x) = x`, so duplicates can't change the peak. (This
   is safe for `max` only; `sum`/`count` would over-count and need `FINAL` input.)
 
+**Producer side — no silent loss into Kafka** (`producer/producer.py`): `produce()` only
+*queues* locally (a background thread sends), so durability needs config, not luck:
+`acks=all` (broker persists before acking), `enable.idempotence=true` (broker drops dups
+from the producer's own retries), `delivery.timeout.ms` (bounded retry budget, then the
+**delivery callback reports failure** — counted, never dropped silently), and a
+**`flush()` on SIGTERM/SIGINT** so a clean `docker compose stop` drains in-flight records
+before exit.
+
 ---
 
 ## Verify it's working

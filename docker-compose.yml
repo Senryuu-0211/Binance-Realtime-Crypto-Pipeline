@@ -243,6 +243,10 @@ services:
       kafka-init:                       # wait until the 'trades' topic exists
         condition: service_completed_successfully
     restart: unless-stopped
+    # Give the graceful-shutdown flush() room to finish before Docker SIGKILLs
+    # (default grace is only 10s). On `docker compose stop` the producer catches
+    # SIGTERM, drains its buffer to Kafka, then exits — no in-flight loss.
+    stop_grace_period: 30s
 
   # ---------------------------------------------------------------------------
   # 7) Consumer — Kafka -> batched insert -> ClickHouse. Built from ./consumer.

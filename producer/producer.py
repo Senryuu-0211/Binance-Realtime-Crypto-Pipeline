@@ -55,18 +55,30 @@ def build_stream_url() -> str:
     return f"{BINANCE_WS_BASE}/stream?streams={streams}"
 
 
+# Running tally of delivery outcomes so failures are OBSERVABLE, not silent.
+STATS = {"delivered": 0, "failed": 0}
+
+
 def on_delivery(err, msg):
-    """Called (by producer.poll) once the broker acknowledges — or rejects — a
-    message. produce() returns immediately; THIS is where we learn the outcome.
+    """Called (by producer.poll / flush) once the broker acknowledges — or, after
+    all retries, finally rejects — a message. produce() returns immediately; THIS
+    callback is where we learn the REAL outcome. We count both outcomes so a
+    failure shows up in logs/metrics instead of vanishing into "fire and forget".
     """
     if err is not None:
-        log.error("delivery FAILED: %s", err)
+        STATS["failed"] += 1
+        log.error("delivery FAILED (total failed=%d): %s", STATS["failed"], err)
+    else:
+        STATS["delivered"] += 1
 
 
 def make_producer() -> Producer:
-    """confluent-kafka Producer config.
+    """confluent-kafka Producer config — tuned so messages are NOT silently lost
+    in the handoff to Kafka.
 
-    Note these are *client-side* knobs; produce() never blocks on the network.
+    produce() is fire-and-QUEUE: it copies the record into librdkafka's internal
+    buffer and a background thread sends it. These settings make that handoff
+    reliable and make failures visible.
     """
     return Producer({
         "bootstrap.servers": KAFKA_BROKER,
@@ -75,8 +87,27 @@ def make_producer() -> Producer:
         "linger.ms": 50,
         # Cheap CPU for less network: compress batches.
         "compression.type": "lz4",
-        # Durability: wait for the broker to persist before acking.
+
+        # --- Durability / no-loss settings -----------------------------------
+        # acks=all: the broker acks ONLY after the record is persisted to all
+        # in-sync replicas. On our single broker that's 1 replica, but it's the
+        # correct setting that stays safe as the cluster grows. (acks=1 acks
+        # before replication; acks=0 doesn't wait at all = trivially lossy.)
         "acks": "all",
+
+        # enable.idempotence: the broker stamps each (producer, partition) record
+        # with a sequence number and DROPS duplicates from the producer's OWN
+        # retries. Without it, retrying after a lost ack writes the message twice;
+        # with it, internal retries are exactly-once onto the partition. librdkafka
+        # auto-enforces the prerequisites (acks=all, retries>0, max.in.flight<=5),
+        # so we don't fight it by hand — we just keep acks=all explicit.
+        "enable.idempotence": True,
+
+        # delivery.timeout.ms: the TOTAL budget to get a record acked, including
+        # all retries. If it can't make it in this window, the delivery callback
+        # fires with an error — so the message is REPORTED as failed, never
+        # silently dropped. (Retry count is managed by idempotence under this cap.)
+        "delivery.timeout.ms": 120000,   # keep retrying for 2 min, then report
     })
 
 
@@ -217,10 +248,19 @@ async def run() -> None:
             log.info("reconnecting in %.1fs (attempt %d)", delay, attempt)
             await asyncio.sleep(delay)
     finally:
-        # Block until every queued message is delivered (or times out).
-        log.info("flushing producer before exit...")
-        producer.flush(10)
-        log.info("bye")
+        # Graceful shutdown: flush the local buffer so in-flight records are
+        # actually sent + acked BEFORE we exit. Without this, anything still
+        # sitting in librdkafka's queue when the process dies is simply LOST —
+        # the whole point of catching SIGTERM/SIGINT (see _install_signal_handlers)
+        # is to reach this flush on a clean `docker compose stop`.
+        # flush() blocks until the queue drains or the timeout elapses, serving
+        # delivery callbacks meanwhile, and returns how many are STILL unsent.
+        queued = len(producer)  # records still queued / in flight right now
+        log.info("flushing producer before exit (%d queued)...", queued)
+        remaining = producer.flush(15)
+        if remaining:
+            log.warning("flush timed out: %d message(s) NOT delivered", remaining)
+        log.info("bye — delivered=%d failed=%d", STATS["delivered"], STATS["failed"])
 
 
 def _install_signal_handlers(stop: asyncio.Event) -> None:
