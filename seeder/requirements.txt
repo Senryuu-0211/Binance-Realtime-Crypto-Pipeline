@@ -1,0 +1,7 @@
+# Pinned (no `latest`) so dev and server build byte-identical images.
+
+# HTTP client for the Binance REST klines API.
+requests==2.32.3
+
+# Same official ClickHouse client the consumer uses (column-oriented insert).
+clickhouse-connect==0.7.19

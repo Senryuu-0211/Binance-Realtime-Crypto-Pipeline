@@ -272,6 +272,31 @@ services:
         condition: service_healthy
     restart: unless-stopped
 
+  # ---------------------------------------------------------------------------
+  # 8) Seeder — ONE-OFF tool: seed all-time peak prices from Binance klines.
+  #
+  #    `profiles: [tools]` means it does NOT start on `docker compose up`. Run it
+  #    on demand: `make seed-peaks` (= docker compose run --rm --build seeder).
+  #    It needs the internet (Binance REST) AND the compose network (ClickHouse),
+  #    both of which `docker compose run` provides.
+  # ---------------------------------------------------------------------------
+  seeder:
+    build: ./seeder
+    container_name: crypto-seeder
+    profiles: ["tools"]
+    environment:
+      SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT}      # same coins as the producer
+      BINANCE_REST_BASE: ${BINANCE_REST_BASE:-https://api.binance.com}
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-clickhouse}
+      CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-8123}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-crypto}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+
 # Named volumes persist data across `docker compose down` (use `down -v` to wipe).
 volumes:
   kafka_data:

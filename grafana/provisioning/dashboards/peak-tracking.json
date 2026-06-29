@@ -1,0 +1,125 @@
+{
+  "uid": "crypto-peaks",
+  "title": "Crypto Peak Tracking",
+  "tags": ["crypto", "phase2", "peak"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "5s",
+  "time": { "from": "now-15m", "to": "now" },
+  "annotations": { "list": [] },
+  "templating": {
+    "list": [
+      {
+        "name": "symbol",
+        "label": "Symbol",
+        "type": "query",
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+        "query": {
+          "refId": "symbol",
+          "editorType": "sql",
+          "queryType": "table",
+          "rawSql": "SELECT DISTINCT symbol FROM crypto.trades ORDER BY symbol"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "current": { "text": ["All"], "value": ["$__all"] }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "gauge",
+      "title": "$symbol — % of all-time peak",
+      "description": "current price / all-time peak * 100. >100% = a new all-time high (fleeting: the MV bumps the peak immediately, so the gauge falls back to ~100%).",
+      "repeat": "symbol",
+      "repeatDirection": "h",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percent",
+          "min": 0,
+          "max": 110,
+          "decimals": 2,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 80 },
+              { "color": "orange", "value": 95 },
+              { "color": "red", "value": 100 }
+            ]
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false },
+        "orientation": "auto",
+        "showThresholdLabels": false,
+        "showThresholdMarkers": true
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "queryType": "table",
+          "rawSql": "SELECT argMax(price, trade_time) / (SELECT maxMerge(peak_state) FROM crypto.peak_prices WHERE symbol = '$symbol') * 100 AS pct_of_peak FROM crypto.trades WHERE symbol = '$symbol' AND trade_time > now() - INTERVAL 10 MINUTE"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "table",
+      "title": "Current price vs all-time peak (all symbols)",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 8 },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "pct_of_peak" },
+            "properties": [
+              { "id": "unit", "value": "percent" },
+              { "id": "custom.cellOptions", "value": { "type": "gauge", "mode": "gradient" } },
+              { "id": "min", "value": 0 },
+              { "id": "max", "value": 110 },
+              {
+                "id": "thresholds",
+                "value": {
+                  "mode": "absolute",
+                  "steps": [
+                    { "color": "green", "value": null },
+                    { "color": "yellow", "value": 80 },
+                    { "color": "orange", "value": 95 },
+                    { "color": "red", "value": 100 }
+                  ]
+                }
+              }
+            ]
+          },
+          {
+            "matcher": { "id": "byRegexp", "options": "(current_price|peak_price)" },
+            "properties": [{ "id": "unit", "value": "currencyUSD" }]
+          }
+        ]
+      },
+      "options": { "showHeader": true },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "queryType": "table",
+          "rawSql": "SELECT t.symbol AS symbol, round(t.current_price, 2) AS current_price, round(p.peak, 2) AS peak_price, round(t.current_price / p.peak * 100, 2) AS pct_of_peak FROM (SELECT symbol, argMax(price, trade_time) AS current_price FROM crypto.trades WHERE trade_time > now() - INTERVAL 10 MINUTE GROUP BY symbol) AS t INNER JOIN (SELECT symbol, maxMerge(peak_state) AS peak FROM crypto.peak_prices GROUP BY symbol) AS p ON t.symbol = p.symbol ORDER BY symbol"
+        }
+      ]
+    }
+  ]
+}

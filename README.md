@@ -5,9 +5,11 @@ ClickHouse → Grafana**. The whole thing comes up with **one `docker compose up
 on any machine — your dev box or the Ubuntu server — building everything from
 source. No pre-built images, no machine-specific paths.
 
-> **Status:** Phase 1 (working skeleton) complete. **Phase 2 Part A** migrated the
-> event log from Redpanda to **real Apache Kafka in KRaft mode** (no ZooKeeper).
-> Anomaly detection, exactly-once delivery, and benchmarking come in later phases.
+> **Status:** Phases 1 & 2 complete. Phase 2 migrated the event log from Redpanda to
+> **real Apache Kafka in KRaft mode** (no ZooKeeper), added **all-time peak tracking**
+> with a Grafana gauge ("% of all-time high"), and a **rolling moving-average** trend line
+> per symbol. Next: **Phase 3 — exactly-once** delivery. (Anomaly detection and
+> benchmarking come after that.)
 
 ---
 
@@ -109,6 +111,82 @@ different advertised names so both audiences get a reachable address:
 
 ---
 
+## Peak tracking — "% of all-time high" (Phase 2 Part B)
+
+A Grafana gauge per coin shows **current price ÷ all-time peak × 100**. The peak is
+maintained cheaply and correctly:
+
+- **`crypto.peak_prices`** — an `AggregatingMergeTree` table with one column
+  `peak_state AggregateFunction(max, Float64)`. We store a max **state**, not a number.
+  Why not `SELECT max(price) FROM trades` at query time? That full-scans the whole trades
+  table on every refresh and slows down as data grows. `max` state is fixed-size and
+  updated in O(1); reads touch only a few state rows, so cost stays flat. See
+  [clickhouse/init/02_peak.sql](clickhouse/init/02_peak.sql).
+- **`crypto.peak_prices_mv`** — a materialized view that maintains it. A ClickHouse MV is
+  an **INSERT-time trigger**: it sees only the block being inserted into `trades`, never
+  history. That's fine for `max` because the all-time max is monotonic
+  (`max(all) = max(max(block₁), max(block₂), …)`).
+- **Seeding (mandatory).** The MV only sees trades from when it started, so without
+  seeding "all-time" would just mean "since the pipeline started". `make seed-peaks` runs
+  [seeder/seed_peaks.py](seeder/seed_peaks.py): it fetches **monthly klines** per symbol
+  from Binance REST (`/api/v3/klines?interval=1M&limit=1000`, taking each candle's `high`)
+  and seeds the historical high. It's **idempotent** — re-running only ever moves the peak
+  up (a `max` state can't be lowered), and it compacts with `OPTIMIZE … FINAL`.
+- **⚠️ Reading it — the `maxMerge` trap.** A State column must be read with the `-Merge`
+  combinator: `SELECT symbol, maxMerge(peak_state) FROM crypto.peak_prices GROUP BY symbol`.
+  Reading `peak_state` directly returns raw state blobs (wrong numbers) **with no error** —
+  it just silently lies. Always pair State columns with `maxMerge(...) + GROUP BY`.
+
+> **Phase 4 note (not built yet):** a value >100% is *fleeting* — the instant price
+> exceeds the peak, the MV bumps the peak and the ratio falls back to ~100%, so the gauge
+> never *sits* above 100%. The future "new all-time high" alert must catch the **event**
+> (price crossed the old peak) at the moment it happens, not poll the gauge state.
+
+```bash
+make seed-peaks   # seed/refresh all-time peaks (run once after first `up`, anytime to refresh)
+make peaks        # read them back the correct way (maxMerge + GROUP BY)
+```
+
+---
+
+## Moving average — trend line (Phase 2, final step)
+
+The **Crypto Trend** dashboard ([grafana/.../moving-average.json](grafana/provisioning/dashboards/moving-average.json))
+shows, per coin, the **price** line and a **moving-average** line on top of it — when price
+is above its MA it's trending up vs its recent average, and vice versa.
+
+**Why a direct query, not a materialized view (the key contrast with peak):** a rolling
+average needs *history* — to average the last N minutes you must look back over many rows.
+A ClickHouse MV only ever sees the single block being inserted, so it **cannot** compute a
+rolling window. Peak works as an MV because `max` is monotonic and per-block; a moving
+average is not. So the MA is a **direct windowed query Grafana runs on each refresh** —
+no MV, no seeding.
+
+It's cheap because it rides the `ORDER BY (symbol, trade_time)` index and aggregates in
+two cheap steps:
+
+```sql
+-- 1) bucket trades by minute (the "price" line), then
+-- 2) a rolling average over the last $ma_window buckets (the smooth MA line)
+SELECT time,
+       avg(price) OVER (ORDER BY time ROWS BETWEEN $ma_window PRECEDING AND CURRENT ROW) AS moving_avg
+FROM (
+    SELECT toStartOfMinute(trade_time) AS time, avg(price) AS price
+    FROM crypto.trades
+    WHERE symbol = '$symbol' AND $__timeFilter(trade_time)
+    GROUP BY time
+)
+ORDER BY time
+```
+
+- **`$ma_window`** is a Grafana variable (15 / 60 / 240 / 720 / 1440 minutes, default 60).
+  Bigger window = more buckets averaged = **smoother** line. Switch 60 ↔ 1440 to see it.
+- **Repeating panel** over the `$symbol` variable (one chart per coin) — chosen over a
+  single 10-line multi-series chart because price+MA for 5 coins in one panel is unreadable;
+  per-coin panels make each crossover obvious. Same `$symbol` pattern as the peak gauges.
+
+---
+
 ## Project layout
 
 ```
@@ -116,7 +194,7 @@ different advertised names so both audiences get a reachable address:
 ├── docker-compose.yml          # the single orchestrator (7 services)
 ├── .env.example                # documented config template (copy to .env)
 ├── .gitignore
-├── Makefile                    # up / down / logs / ps / topic / query / clean
+├── Makefile                    # up / down / logs / ps / topic / query / seed-peaks / peaks / clean
 ├── producer/                   # Binance WS → Kafka
 │   ├── Dockerfile
 │   ├── requirements.txt
@@ -125,14 +203,22 @@ different advertised names so both audiences get a reachable address:
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── consumer.py
+├── seeder/                     # one-off: seed all-time peaks from Binance klines
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── seed_peaks.py
 ├── clickhouse/
-│   └── init/01_schema.sql       # auto-creates crypto.trades on first boot
+│   └── init/
+│       ├── 01_schema.sql        # crypto.trades (MergeTree)
+│       └── 02_peak.sql          # crypto.peak_prices (AggregatingMergeTree) + MV
 └── grafana/
     └── provisioning/
         ├── datasources/clickhouse.yml
         └── dashboards/
             ├── provider.yml
-            └── crypto-live.json
+            ├── crypto-live.json       # live price per symbol
+            ├── peak-tracking.json     # gauge: % of all-time peak
+            └── moving-average.json    # price vs rolling moving-average per symbol
 ```
 
 ---
@@ -155,11 +241,18 @@ copy .env.example .env
 docker compose up -d --build
 ```
 
+Then seed the all-time peaks once (needed for the peak gauge — see
+[Peak tracking](#peak-tracking--of-all-time-high-phase-2-part-b)):
+
+```bash
+make seed-peaks       # fetch historical highs from Binance, populate crypto.peak_prices
+```
+
 Then open:
 
 | URL | What |
 |---|---|
-| http://localhost:3000 | **Grafana** → dashboard **Crypto Live** (login `admin` / `admin`) |
+| http://localhost:3000 | **Grafana** → **Crypto Live** (price) · **Crypto Peak Tracking** (gauge) · **Crypto Trend** (price vs moving average) — login `admin` / `admin` |
 | http://localhost:8080 | **Kafka UI** → cluster `crypto-local` → topic `trades`, watch messages |
 
 Useful commands:
@@ -170,6 +263,8 @@ make logs             # tail everything
 make logs-producer    # just the producer (watch connects/reconnects)
 make logs-consumer    # just the consumer (watch "inserted N rows")
 make query            # row count + latest price per symbol, straight from ClickHouse
+make seed-peaks       # seed/refresh all-time peaks from Binance klines (idempotent)
+make peaks            # read all-time peak per symbol (maxMerge + GROUP BY)
 make down             # stop (keeps data)
 make clean            # stop AND wipe data volumes (full reset)
 ```
@@ -277,8 +372,12 @@ phase).
 3. **Topic:** open Kafka UI (http://localhost:8080) → cluster `crypto-local` → topic `trades`
    → 3 partitions, live messages keyed by symbol (and check the consumer group's lag near 0).
 4. **ClickHouse:** `make query` → row counts climbing, a realistic `last_price`.
-5. **Grafana:** http://localhost:3000 → **Crypto Live** → price line moving, current-price stat updating.
-6. **Reconnect:** `docker compose restart producer` → logs show backoff → reconnect → data resumes.
+5. **Peaks:** `make seed-peaks` then `make peaks` → sensible all-time highs for each symbol
+   (e.g. BTC near its real ATH, not a tiny number).
+6. **Grafana:** http://localhost:3000 → **Crypto Live** (price moving), **Crypto Peak
+   Tracking** (gauge per coin), and **Crypto Trend** (price + moving-average line per coin;
+   switch the `MA window` variable 60 ↔ 1440 to see the smoothing change).
+7. **Reconnect:** `docker compose restart producer` → logs show backoff → reconnect → data resumes.
 
 ---
 
@@ -301,3 +400,9 @@ phase).
 - **Schema didn't apply:** init SQL runs only on a *fresh* ClickHouse volume. After
   changing it, `make clean` to wipe and re-init. (The consumer also creates the table
   idempotently on startup as a safety net.)
+- **Peak gauge empty / `peak_prices` doesn't exist:** on an already-running ClickHouse the
+  init `02_peak.sql` won't re-run — `make seed-peaks` applies the peak schema (table + MV)
+  *and* seeds it. Run it once after `up`.
+- **Seeded peaks look tiny / wrong:** the kline `high` is index 2 of each array; a tiny
+  number means it's being read from the wrong field. If you get **HTTP 451**, Binance is
+  geo-blocking — set `BINANCE_REST_BASE=https://data-api.binance.vision` in `.env`.

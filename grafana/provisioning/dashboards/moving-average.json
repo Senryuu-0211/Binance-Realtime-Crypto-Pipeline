@@ -1,0 +1,112 @@
+{
+  "uid": "crypto-trend",
+  "title": "Crypto Trend (Price vs Moving Average)",
+  "tags": ["crypto", "phase2", "trend"],
+  "timezone": "browser",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "10s",
+  "time": { "from": "now-6h", "to": "now" },
+  "annotations": { "list": [] },
+  "templating": {
+    "list": [
+      {
+        "name": "symbol",
+        "label": "Symbol",
+        "type": "query",
+        "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+        "query": {
+          "refId": "symbol",
+          "editorType": "sql",
+          "queryType": "table",
+          "rawSql": "SELECT DISTINCT symbol FROM crypto.trades ORDER BY symbol"
+        },
+        "refresh": 2,
+        "sort": 1,
+        "multi": true,
+        "includeAll": true,
+        "current": { "text": ["All"], "value": ["$__all"] }
+      },
+      {
+        "name": "ma_window",
+        "label": "MA window (minutes)",
+        "description": "Span of the moving average, in minutes. Bigger = smoother line. Try 60 vs 1440 to see the smoothing change.",
+        "type": "custom",
+        "query": "15,60,240,720,1440",
+        "includeAll": false,
+        "multi": false,
+        "current": { "text": "60", "value": "60", "selected": true },
+        "options": [
+          { "text": "15", "value": "15", "selected": false },
+          { "text": "60", "value": "60", "selected": true },
+          { "text": "240", "value": "240", "selected": false },
+          { "text": "720", "value": "720", "selected": false },
+          { "text": "1440", "value": "1440", "selected": false }
+        ]
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "$symbol — price vs moving average (${ma_window}m)",
+      "description": "Per-minute price (thin) vs a rolling $ma_window-minute moving average (thick). When price sits above the MA it's trending up vs its recent average, and vice versa.",
+      "repeat": "symbol",
+      "repeatDirection": "h",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 9, "w": 12, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "currencyUSD",
+          "color": { "mode": "palette-classic" },
+          "custom": {
+            "drawStyle": "line",
+            "lineInterpolation": "linear",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": true,
+            "axisPlacement": "auto"
+          }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "moving_avg" },
+            "properties": [
+              { "id": "custom.lineWidth", "value": 3 },
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "orange" } }
+            ]
+          },
+          {
+            "matcher": { "id": "byName", "options": "price" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "semi-dark-blue" } }
+            ]
+          }
+        ]
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "none" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "queryType": "timeseries",
+          "rawSql": "SELECT toStartOfMinute(trade_time) AS time, avg(price) AS price FROM crypto.trades WHERE symbol = '$symbol' AND $__timeFilter(trade_time) GROUP BY time ORDER BY time"
+        },
+        {
+          "refId": "B",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "queryType": "timeseries",
+          "rawSql": "SELECT time, avg(price) OVER (ORDER BY time ROWS BETWEEN $ma_window PRECEDING AND CURRENT ROW) AS moving_avg FROM (SELECT toStartOfMinute(trade_time) AS time, avg(price) AS price FROM crypto.trades WHERE symbol = '$symbol' AND $__timeFilter(trade_time) GROUP BY time) ORDER BY time"
+        }
+      ]
+    }
+  ]
+}
