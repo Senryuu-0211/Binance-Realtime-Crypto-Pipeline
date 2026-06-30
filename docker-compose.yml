@@ -277,7 +277,32 @@ services:
     restart: unless-stopped
 
   # ---------------------------------------------------------------------------
-  # 8) Seeder — ONE-OFF tool: seed all-time peak prices from Binance klines.
+  # 8) Healthcheck — scheduled pipeline monitoring (every CHECK_INTERVAL).
+  #    Writes freshness + per-symbol-stall results into crypto.health_checks;
+  #    Grafana reads that table to display health and fire alerts (in-stack, no
+  #    external Slack/SMTP). A simple sleep-loop, NOT Airflow — one periodic job.
+  # ---------------------------------------------------------------------------
+  healthcheck:
+    build: ./healthcheck
+    container_name: crypto-healthcheck
+    environment:
+      SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT}      # same coins as the producer
+      CHECK_INTERVAL_SECONDS: ${HEALTH_CHECK_INTERVAL_SECONDS:-300}
+      FRESHNESS_THRESHOLD_SECONDS: ${FRESHNESS_THRESHOLD_SECONDS:-120}
+      SYMBOL_STALL_THRESHOLD_SECONDS: ${SYMBOL_STALL_THRESHOLD_SECONDS:-300}
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-clickhouse}
+      CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-8123}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-crypto}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # 9) Seeder — ONE-OFF tool: seed all-time peak prices from Binance klines.
   #
   #    `profiles: [tools]` means it does NOT start on `docker compose up`. Run it
   #    on demand: `make seed-peaks` (= docker compose run --rm --build seeder).

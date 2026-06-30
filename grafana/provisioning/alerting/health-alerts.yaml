@@ -1,0 +1,100 @@
+# =============================================================================
+# Grafana ALERT RULES as code (unified alerting), reading crypto.health_checks.
+#
+# Kept IN-STACK on purpose: no Slack/email/PagerDuty wiring — the rules fire and
+# show their state in Grafana's Alerting UI (and as state on the health panels).
+# Production would attach a contact point (PagerDuty/Slack) to route these; that
+# is a notification-policy change, NOT a query change.
+#
+# Each rule is the standard 3-node alert:
+#   A = SQL query returning a single number (is the LATEST status bad? how many?)
+#   B = reduce A to its last value
+#   C = threshold: fire when that value > 0
+# We alert on the LATEST recorded status (not a count over a window) so the alert
+# CLEARS promptly once the pipeline recovers and the next check writes OK.
+# =============================================================================
+apiVersion: 1
+
+groups:
+  - orgId: 1
+    name: pipeline-health
+    folder: Pipeline Health
+    interval: 1m                      # Grafana evaluates these rules every minute
+    rules:
+      # --- Overall freshness: is the WHOLE pipeline stalled? -----------------
+      - uid: health-freshness-stale
+        title: Pipeline data is STALE (end-to-end freshness)
+        condition: C
+        for: 0m                       # fire as soon as the latest check is STALE
+        noDataState: OK               # no health rows yet => not an alert
+        execErrState: OK              # transient query error => don't false-fire
+        labels:
+          severity: critical
+        annotations:
+          summary: "No fresh trades — the pipeline has likely stalled. Check producer, consumer, and Kafka."
+        data:
+          - refId: A
+            relativeTimeRange: { from: 3600, to: 0 }
+            datasourceUid: clickhouse
+            model:
+              refId: A
+              editorType: sql
+              queryType: table
+              datasource: { type: grafana-clickhouse-datasource, uid: clickhouse }
+              rawSql: "SELECT toFloat64(argMax(status, checked_at) = 'STALE') AS v FROM crypto.health_checks WHERE check_name = 'freshness' AND checked_at > now() - INTERVAL 1 HOUR"
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }
+
+      # --- Per-symbol stall: is ANY single symbol's stream dead? -------------
+      - uid: health-symbol-stalled
+        title: A symbol stream is STALLED
+        condition: C
+        for: 0m
+        noDataState: OK
+        execErrState: OK
+        labels:
+          severity: warning
+        annotations:
+          summary: "One or more symbols had no trades within the stall threshold while others kept flowing (partial failure)."
+        data:
+          - refId: A
+            relativeTimeRange: { from: 3600, to: 0 }
+            datasourceUid: clickhouse
+            model:
+              refId: A
+              editorType: sql
+              queryType: table
+              datasource: { type: grafana-clickhouse-datasource, uid: clickhouse }
+              rawSql: "SELECT toFloat64(countIf(s = 'STALLED')) AS v FROM (SELECT symbol, argMax(status, checked_at) AS s FROM crypto.health_checks WHERE check_name = 'symbol_stall' AND checked_at > now() - INTERVAL 1 HOUR GROUP BY symbol)"
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }

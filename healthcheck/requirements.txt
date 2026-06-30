@@ -1,0 +1,4 @@
+# Pinned (no `latest`) so dev and server build byte-identical images.
+
+# Official ClickHouse client — the health check only reads trades + writes results.
+clickhouse-connect==0.7.19

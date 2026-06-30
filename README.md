@@ -161,8 +161,8 @@ rolling window. Peak works as an MV because `max` is monotonic and per-block; a 
 average is not. So the MA is a **direct windowed query Grafana runs on each refresh** —
 no MV, no seeding.
 
-It's cheap because it rides the `ORDER BY (symbol, trade_time)` index and aggregates in
-two cheap steps:
+It's cheap because the day-`PARTITION` prunes the time range and it aggregates in two
+cheap steps:
 
 ```sql
 -- 1) bucket trades by minute (the "price" line), then
@@ -186,14 +186,52 @@ ORDER BY time
 
 ---
 
+## Pipeline health monitoring & alerting
+
+Dashboards are *passive* — they only help if someone is looking. A streaming pipeline needs
+**active** monitoring that notices a stall on its own and alerts, before a stakeholder sees
+stale numbers. (Same shape as watching an industrial sensor-telemetry stream for dropouts.)
+The `healthcheck` service ([healthcheck/health_check.py](healthcheck/health_check.py)) runs
+on a schedule and writes results to **`crypto.health_checks`**; Grafana reads that table to
+both **show** health and **alert** on it.
+
+**Two checks (each catches what the other misses):**
+- **Freshness (overall):** `now() − max(trade_time)`. If the newest trade is older than
+  `FRESHNESS_THRESHOLD_SECONDS` (default 120s) → `STALE` = the whole pipeline stopped.
+- **Per-symbol stall:** last-trade age for *each* symbol. If one symbol exceeds
+  `SYMBOL_STALL_THRESHOLD_SECONDS` (default 300s) → `STALLED`. This catches a **partial**
+  failure the overall check can't: overall `max()` is dominated by the busiest coin, so BTC
+  flowing happily hides a silently-dead XRP subscription. Only the per-symbol view sees it.
+
+**Design choices (the "why"):**
+- **A 5-minute sleep-loop, not Airflow.** This is *one* periodic job with no dependency
+  graph. Airflow (scheduler + webserver + metadata DB + workers) earns its keep on multi-step
+  DAGs with retries/backfills — over-engineering for a single recurring check. Reach for it
+  when the dependency graph appears, not before.
+- **Alerting in-stack via Grafana, no Slack/SMTP.** The check only records status rows;
+  Grafana (already here) displays them and fires alert rules
+  ([grafana/provisioning/alerting/health-alerts.yaml](grafana/provisioning/alerting/health-alerts.yaml)),
+  keeping the stack self-contained. Production would attach a PagerDuty/Slack contact point —
+  a notification-policy change, not a code change.
+- **Loose per-symbol threshold** so a naturally-quiet low-volume coin doesn't false-alarm;
+  tune all thresholds (and the interval) via env.
+- **The monitor never crashes the pipeline:** a ClickHouse blip is logged and retried next
+  cycle.
+
+See it on the **Pipeline Health** dashboard (freshness stat, per-symbol age table, lag-over-time),
+and the rules in Grafana → Alerting. Thresholds: `HEALTH_CHECK_INTERVAL_SECONDS`,
+`FRESHNESS_THRESHOLD_SECONDS`, `SYMBOL_STALL_THRESHOLD_SECONDS`.
+
+---
+
 ## Project layout
 
 ```
 .
-├── docker-compose.yml          # the single orchestrator (7 services)
+├── docker-compose.yml          # the single orchestrator (8 services + seeder tool)
 ├── .env.example                # documented config template (copy to .env)
 ├── .gitignore
-├── Makefile                    # up / down / logs / ps / topic / query / seed-peaks / peaks / clean
+├── Makefile                    # up / down / logs / ps / topic / query / seed-peaks / peaks / dedup-check / clean
 ├── producer/                   # Binance WS → Kafka
 │   ├── Dockerfile
 │   ├── requirements.txt
@@ -206,18 +244,25 @@ ORDER BY time
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── seed_peaks.py
+├── healthcheck/                # scheduled freshness + per-symbol stall monitor
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── health_check.py
 ├── clickhouse/
 │   └── init/
-│       ├── 01_schema.sql        # crypto.trades (MergeTree)
-│       └── 02_peak.sql          # crypto.peak_prices (AggregatingMergeTree) + MV
+│       ├── 01_schema.sql        # crypto.trades (ReplacingMergeTree, Decimal, trade_id)
+│       ├── 02_peak.sql          # crypto.peak_prices (AggregatingMergeTree) + MV
+│       └── 03_health.sql        # crypto.health_checks (MergeTree, TTL)
 └── grafana/
     └── provisioning/
         ├── datasources/clickhouse.yml
+        ├── alerting/health-alerts.yaml   # STALE / STALLED alert rules
         └── dashboards/
             ├── provider.yml
             ├── crypto-live.json       # live price per symbol
             ├── peak-tracking.json     # gauge: % of all-time peak
-            └── moving-average.json    # price vs rolling moving-average per symbol
+            ├── moving-average.json    # price vs rolling moving-average per symbol
+            └── pipeline-health.json   # freshness + per-symbol stall + alerts
 ```
 
 ---
@@ -251,7 +296,7 @@ Then open:
 
 | URL | What |
 |---|---|
-| http://localhost:3000 | **Grafana** → **Crypto Live** (price) · **Crypto Peak Tracking** (gauge) · **Crypto Trend** (price vs moving average) — login `admin` / `admin` |
+| http://localhost:3000 | **Grafana** → **Crypto Live** · **Crypto Peak Tracking** · **Crypto Trend** · **Pipeline Health** (+ Alerting) — login `admin` / `admin` |
 | http://localhost:8080 | **Kafka UI** → cluster `crypto-local` → topic `trades`, watch messages |
 
 Useful commands:
@@ -398,7 +443,12 @@ before exit.
 6. **Grafana:** http://localhost:3000 → **Crypto Live** (price moving), **Crypto Peak
    Tracking** (gauge per coin), and **Crypto Trend** (price + moving-average line per coin;
    switch the `MA window` variable 60 ↔ 1440 to see the smoothing change).
-7. **Reconnect:** `docker compose restart producer` → logs show backoff → reconnect → data resumes.
+7. **Health:** `docker compose logs healthcheck` shows an `OK` summary each cycle, and
+   `crypto.health_checks` gains a new row set every `HEALTH_CHECK_INTERVAL_SECONDS`. The
+   **Pipeline Health** dashboard shows freshness + per-symbol age. Stop the producer for a few
+   minutes → freshness goes `STALE` and the Grafana alert fires; restart → it clears. Stop one
+   symbol only → that symbol flags `STALLED` while the rest stay `OK`.
+8. **Reconnect:** `docker compose restart producer` → logs show backoff → reconnect → data resumes.
 
 ---
 
