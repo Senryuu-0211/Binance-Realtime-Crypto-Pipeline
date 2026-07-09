@@ -14,10 +14,10 @@
 
 CREATE TABLE IF NOT EXISTS crypto.health_checks
 (
-    check_name  LowCardinality(String),   -- 'freshness' (end-to-end lag) | 'symbol_stall'
+    check_name  LowCardinality(String),   -- 'freshness' | 'symbol_stall' | 'trade_gap'
     symbol      LowCardinality(String),   -- 'ALL' for the overall check, or the coin
-    status      LowCardinality(String),   -- 'OK' | 'STALE' | 'STALLED'
-    value       Float64,                  -- the measured age/lag, in SECONDS
+    status      LowCardinality(String),   -- 'OK' | 'STALE' | 'STALLED' | 'GAP_DETECTED'
+    value       Float64,                  -- age/lag in SECONDS (freshness/stall) or missing-trade COUNT (gap)
     checked_at  DateTime64(3, 'UTC') DEFAULT now64(3)   -- when the check ran
 )
 ENGINE = MergeTree

@@ -98,3 +98,45 @@ groups:
               expression: B
               conditions:
                 - evaluator: { type: gt, params: [0] }
+
+      # --- Trade-ID gap: did the stream LOSE events during a reconnect? ------
+      - uid: health-trade-gap
+        title: Trade-ID gaps detected (missing events)
+        condition: C
+        for: 0m
+        noDataState: OK
+        execErrState: OK
+        labels:
+          severity: warning
+        annotations:
+          summary: >-
+            One or more symbols have gaps in their trade_id sequence — events
+            were lost during a WebSocket disconnect. Check the value column for
+            the count of missing trades per symbol.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 3600, to: 0 }
+            datasourceUid: clickhouse
+            model:
+              refId: A
+              editorType: sql
+              queryType: table
+              datasource: { type: grafana-clickhouse-datasource, uid: clickhouse }
+              rawSql: "SELECT toFloat64(countIf(s = 'GAP_DETECTED')) AS v FROM (SELECT symbol, argMax(status, checked_at) AS s FROM crypto.health_checks WHERE check_name = 'trade_gap' AND checked_at > now() - INTERVAL 1 HOUR GROUP BY symbol)"
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [0] }

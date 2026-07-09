@@ -81,11 +81,70 @@
       ]
     },
     {
+      "id": 4,
+      "type": "table",
+      "title": "Per-symbol — missing trade_ids (latest check)",
+      "description": "Gaps in trade_id sequence = events lost during a WebSocket disconnect. 0 = clean. >0 = data was lost and the count shows how many trades are missing in the last check window.",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 6, "w": 12, "x": 0, "y": 6 },
+      "fieldConfig": {
+        "defaults": {},
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "missing_trades" },
+            "properties": [
+              { "id": "custom.cellOptions", "value": { "type": "color-background" } },
+              { "id": "thresholds", "value": { "mode": "absolute", "steps": [ { "color": "green", "value": null }, { "color": "orange", "value": 1 }, { "color": "red", "value": 100 } ] } }
+            ]
+          }
+        ]
+      },
+      "options": { "showHeader": true },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "queryType": "table",
+          "rawSql": "SELECT symbol, argMax(value, checked_at) AS missing_trades, argMax(status, checked_at) AS status FROM crypto.health_checks WHERE check_name = 'trade_gap' GROUP BY symbol ORDER BY symbol"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Trade-ID gaps over time (per symbol)",
+      "description": "Count of missing trade_ids per symbol at each health check. Spikes indicate WebSocket disconnects that caused data loss.",
+      "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+      "gridPos": { "h": 6, "w": 12, "x": 12, "y": 6 },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "custom": { "drawStyle": "bars", "lineWidth": 1, "fillOpacity": 50, "showPoints": "never", "spanNulls": false, "stacking": { "mode": "none" } },
+          "color": { "mode": "palette-classic" }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": { "displayMode": "list", "placement": "bottom", "showLegend": true },
+        "tooltip": { "mode": "multi", "sort": "desc" }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
+          "editorType": "sql",
+          "queryType": "timeseries",
+          "rawSql": "SELECT checked_at AS time, symbol, value AS missing_trades FROM crypto.health_checks WHERE check_name = 'trade_gap' AND $__timeFilter(checked_at) ORDER BY time"
+        }
+      ]
+    },
+    {
       "id": 3,
       "type": "timeseries",
       "title": "Freshness lag over time",
       "datasource": { "type": "grafana-clickhouse-datasource", "uid": "clickhouse" },
-      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 6 },
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 12 },
       "fieldConfig": {
         "defaults": {
           "unit": "s",

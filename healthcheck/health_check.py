@@ -18,13 +18,20 @@ reads them to display health AND to fire alerts. No external integrations / SMTP
 to configure. In real production you'd route Grafana alerts onward to PagerDuty
 or Slack; that's a contact-point change, not a code change.
 
-The two checks (and why both):
+The three checks (and why ALL THREE are needed):
   - FRESHNESS (overall): now() - newest trade_time. Catches a total stall — the
     whole pipeline stopped writing.
   - PER-SYMBOL STALL: last trade age for EACH symbol. Catches a PARTIAL failure
     the overall check would miss — e.g. BTC keeps flowing (so overall freshness
     looks fine) but XRP's subscription silently dropped. Overall max() is
     dominated by the busiest symbol, so only a per-symbol view sees this.
+  - TRADE-ID GAP: checks for missing sequential trade_ids within each symbol's
+    stream. Binance assigns trade_id (field "t") as a monotonically increasing
+    integer per symbol. If we receive ids 1000, 1001, 1003 then id 1002 was lost
+    (WebSocket disconnected briefly, the trade happened during the gap, and we
+    never received it). Stall check can't catch this — the stream is flowing,
+    it just has holes. Gap + stall together cover both "total silence" and
+    "resumed but lost events in between".
 """
 
 import logging
@@ -46,6 +53,10 @@ FRESHNESS_THRESHOLD_SECONDS = float(os.environ.get("FRESHNESS_THRESHOLD_SECONDS"
 # value would false-alarm at quiet times. 5 min is safe for the liquid majors we
 # track; raise it if you add a thin-liquidity symbol.
 SYMBOL_STALL_THRESHOLD_SECONDS = float(os.environ.get("SYMBOL_STALL_THRESHOLD_SECONDS", "300"))
+# Gap detection: look back this many minutes for missing trade_ids.
+# 10 minutes is wide enough to catch gaps from brief WebSocket drops but narrow
+# enough that the window-function query stays fast on a single node.
+GAP_CHECK_WINDOW_MINUTES = int(os.environ.get("GAP_CHECK_WINDOW_MINUTES", "10"))
 
 CLICKHOUSE_HOST = os.environ.get("CLICKHOUSE_HOST", "clickhouse")
 CLICKHOUSE_PORT = int(os.environ.get("CLICKHOUSE_PORT", "8123"))
@@ -142,22 +153,90 @@ def check_symbol_stalls(client) -> list:
     return out
 
 
+def check_trade_gaps(client) -> list:
+    """Detect missing trade_ids within each symbol's stream.
+
+    Binance assigns trade_id (field "t") as a monotonically increasing integer
+    per symbol: ...1000, 1001, 1002, 1003, ... If we see 1000 then 1003, we know
+    1001 and 1002 were lost (WebSocket was disconnected when those trades happened).
+
+    HOW IT WORKS:
+      1. DISTINCT (symbol, trade_id) within the last N minutes — removes any
+         ReplacingMergeTree duplicates that haven't merged yet.
+      2. lagInFrame() compares each trade_id to its predecessor within the same
+         symbol, ordered by trade_id.
+      3. difference - 1 = number of missing ids between consecutive received ids.
+         Continuous → 0. Jump from 1000 to 1003 → 2 missing.
+      4. The first row per symbol has no predecessor; lagInFrame defaults to the
+         trade_id itself → difference = 0 → no false positive.
+      5. We sum the missing count per symbol.
+
+    WHY THIS COMPLEMENTS STALL CHECK (not replaces):
+      - Stall catches "stream went completely silent" (no new trade_ids at all).
+      - Gap catches "stream is flowing but has holes" (reconnected after a brief
+        drop; new ids are arriving but some in between were lost).
+      - A dead stream has no "after" ids → gap can't detect it. Only stall can.
+      - A flowing-but-leaky stream looks fine to stall (data keeps arriving).
+        Only gap can see the holes.
+      Together they cover the full spectrum of data loss at the source edge.
+
+    RETURNS: one row per symbol with the count of missing trade_ids (0 = clean).
+    Status is GAP_DETECTED when any ids are missing, OK otherwise.
+    """
+    in_list = ", ".join("'" + s.replace("'", "") + "'" for s in SYMBOLS)
+    query = (
+        f"SELECT symbol, sum(missing) AS missing_trades "
+        f"FROM ("
+        f"  SELECT symbol, "
+        f"    trade_id - lagInFrame(trade_id, 1, trade_id) "
+        f"      OVER (PARTITION BY symbol ORDER BY trade_id) - 1 AS missing "
+        f"  FROM ("
+        f"    SELECT DISTINCT symbol, trade_id "
+        f"    FROM {CLICKHOUSE_DB}.trades "
+        f"    WHERE symbol IN ({in_list}) "
+        f"      AND trade_time > now() - INTERVAL {GAP_CHECK_WINDOW_MINUTES} MINUTE"
+        f"  )"
+        f") "
+        f"WHERE missing > 0 "
+        f"GROUP BY symbol"
+    )
+    rows = client.query(query).result_rows
+    gaps_by_symbol = {sym: int(cnt) for sym, cnt in rows}
+
+    out = []
+    for sym in SYMBOLS:
+        missing = gaps_by_symbol.get(sym, 0)
+        status = "GAP_DETECTED" if missing > 0 else "OK"
+        out.append(["trade_gap", sym, status, float(missing)])
+    return out
+
+
 def run_once(client) -> None:
-    """One cycle: run both checks, write all result rows in a single insert."""
+    """One cycle: run all checks, write all result rows in a single insert."""
     rows = [check_freshness(client)]
     rows.extend(check_symbol_stalls(client))
+    rows.extend(check_trade_gaps(client))
     client.insert(f"{CLICKHOUSE_DB}.health_checks", rows, column_names=HEALTH_COLUMNS)
 
     # Log a one-line summary so `docker compose logs healthcheck` is readable.
-    summary = ", ".join(f"{r[1]}={r[2]}({r[3]:.0f}s)" for r in rows)
+    # For gap rows, value = count of missing trade_ids (not seconds), so label accordingly.
+    parts = []
+    for r in rows:
+        if r[0] == "trade_gap":
+            parts.append(f"{r[1]}={r[2]}({r[3]:.0f} missing)")
+        else:
+            parts.append(f"{r[1]}={r[2]}({r[3]:.0f}s)")
+    summary = ", ".join(parts)
     bad = [r for r in rows if r[2] != "OK"]
     (log.warning if bad else log.info)("health: %s", summary)
 
 
 def main() -> None:
     client = connect()
-    log.info("health checks every %.0fs (freshness>%.0fs=STALE, per-symbol>%.0fs=STALLED)",
-             CHECK_INTERVAL_SECONDS, FRESHNESS_THRESHOLD_SECONDS, SYMBOL_STALL_THRESHOLD_SECONDS)
+    log.info("health checks every %.0fs (freshness>%.0fs=STALE, per-symbol>%.0fs=STALLED, "
+             "gap window=%dmin)",
+             CHECK_INTERVAL_SECONDS, FRESHNESS_THRESHOLD_SECONDS,
+             SYMBOL_STALL_THRESHOLD_SECONDS, GAP_CHECK_WINDOW_MINUTES)
     while _running:
         try:
             run_once(client)

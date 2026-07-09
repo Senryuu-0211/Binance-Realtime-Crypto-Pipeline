@@ -5,10 +5,11 @@ ClickHouse → Grafana**. The whole thing comes up with **one `docker compose up
 on any machine — your dev box or the Ubuntu server — building everything from
 source. No pre-built images, no machine-specific paths.
 
-> **Status:** Phases 1 & 2 complete (Kafka KRaft, all-time peak gauge, rolling
-> moving-average). **Phase 3 (in progress)** makes ingestion **idempotent / effectively-once**:
-> `trade_id` dedup key + `ReplacingMergeTree`, and `Decimal64(8)` money. Next within Phase 3:
-> producer idempotence; then anomaly detection and benchmarking.
+> **Status:** Phases 1–3 + 5 complete. Kafka KRaft · all-time peak gauge · rolling
+> moving-average · **effectively-once** ingestion (`trade_id` dedup + `ReplacingMergeTree`,
+> `Decimal64(8)`, hardened producer) · scheduled **health-check + Grafana alerting** ·
+> **benchmark** (**100k events/s, p99 613 ms** single-node — via consumer scaling + batch
+> tuning). See the [Benchmark](#benchmark-single-node) section.
 
 ---
 
@@ -44,20 +45,20 @@ Kafka listeners:  containers → kafka:9092 (INTERNAL)   |   host → localhost:
 
 ### Components & key choices
 
-| Service | Image / Build | Why |
-|---|---|---|
-| **kafka** | `apache/kafka` (KRaft) | Industry-standard event-streaming backbone; strongest connector ecosystem (Kafka Connect, Schema Registry). KRaft = no ZooKeeper. Official Apache image, single broker for single-node. |
-| **kafka-init** | `apache/kafka` (one-shot) | Creates the `trades` topic with 3 partitions / RF 1, then exits. |
-| **kafka-ui** | `provectuslabs/kafka-ui` | Web UI to *watch* topics, messages, and consumer-group lag — great for learning/debugging. |
-| **clickhouse** | `clickhouse/clickhouse-server` | Columnar OLAP store; fast inserts + time-range scans. |
-| **grafana** | `grafana/grafana` | Dashboards, datasource + dashboard provisioned **as code**. |
-| **producer** | built from `./producer` | Binance WS → Kafka. |
-| **consumer** | built from `./consumer` | Kafka → batched insert → ClickHouse. |
+| Service        | Image / Build                  | Why                                                                                                                                                                                     |
+| -------------- | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| **kafka**      | `apache/kafka` (KRaft)         | Industry-standard event-streaming backbone; strongest connector ecosystem (Kafka Connect, Schema Registry). KRaft = no ZooKeeper. Official Apache image, single broker for single-node. |
+| **kafka-init** | `apache/kafka` (one-shot)      | Creates the `trades` topic with 3 partitions / RF 1, then exits.                                                                                                                        |
+| **kafka-ui**   | `provectuslabs/kafka-ui`       | Web UI to _watch_ topics, messages, and consumer-group lag — great for learning/debugging.                                                                                              |
+| **clickhouse** | `clickhouse/clickhouse-server` | Columnar OLAP store; fast inserts + time-range scans.                                                                                                                                   |
+| **grafana**    | `grafana/grafana`              | Dashboards, datasource + dashboard provisioned **as code**.                                                                                                                             |
+| **producer**   | built from `./producer`        | Binance WS → Kafka.                                                                                                                                                                     |
+| **consumer**   | built from `./consumer`        | Kafka → batched insert → ClickHouse.                                                                                                                                                    |
 
 **Library choices (and why):**
 
-- **`confluent-kafka`** (producer *and* consumer) — wraps librdkafka (C); the most
-  maintained, fastest Python Kafka client. Its `produce()` is *non-blocking*
+- **`confluent-kafka`** (producer _and_ consumer) — wraps librdkafka (C); the most
+  maintained, fastest Python Kafka client. Its `produce()` is _non-blocking_
   (buffers locally, a background thread sends), so it fits the producer's async
   WebSocket loop without needing an async-specific Kafka library.
 - **`websockets`** — mature async WS client; **auto-replies to Binance's server
@@ -78,7 +79,7 @@ producer/consumer already spoke the Kafka protocol via `confluent-kafka`, so thi
 **migration, not a rewrite**: only broker addresses and the broker service changed.
 
 **KRaft (Kafka Raft) — what replaced ZooKeeper.** Classic Kafka stored all cluster
-metadata (topics, partitions, leaders, ACLs, configs) in a *separate* ZooKeeper
+metadata (topics, partitions, leaders, ACLs, configs) in a _separate_ ZooKeeper
 ensemble. KRaft moves that metadata into an internal Kafka log managed by **controller**
 nodes using the Raft consensus protocol — so there's one fewer system to run, operate,
 and fail. It's the modern, default architecture (ZooKeeper mode is removed in Kafka 4.x).
@@ -97,16 +98,16 @@ and fail. It's the modern, default architecture (ZooKeeper mode is removed in Ka
   don't exist).
 
 **Advertised listeners — the #1 Kafka-in-Docker gotcha.** A client connects to a
-*bootstrap* address, and Kafka replies with the **advertised** address to use for the
+_bootstrap_ address, and Kafka replies with the **advertised** address to use for the
 actual partition leader. If that advertised address is wrong, the first handshake
 "works" but every produce/fetch afterwards fails. We expose two client listeners with
 different advertised names so both audiences get a reachable address:
 
-| Listener | Port | Advertised as | Who uses it |
-|---|---|---|---|
-| `INTERNAL` | 9092 | `kafka:9092` | other containers (producer, consumer, kafka-ui) |
-| `EXTERNAL` | 19092 | `localhost:19092` | your host / dev box |
-| `CONTROLLER` | 9093 | *(not advertised)* | internal Raft metadata traffic only |
+| Listener     | Port  | Advertised as      | Who uses it                                     |
+| ------------ | ----- | ------------------ | ----------------------------------------------- |
+| `INTERNAL`   | 9092  | `kafka:9092`       | other containers (producer, consumer, kafka-ui) |
+| `EXTERNAL`   | 19092 | `localhost:19092`  | your host / dev box                             |
+| `CONTROLLER` | 9093  | _(not advertised)_ | internal Raft metadata traffic only             |
 
 ---
 
@@ -136,9 +137,9 @@ maintained cheaply and correctly:
   Reading `peak_state` directly returns raw state blobs (wrong numbers) **with no error** —
   it just silently lies. Always pair State columns with `maxMerge(...) + GROUP BY`.
 
-> **Phase 4 note (not built yet):** a value >100% is *fleeting* — the instant price
+> **Phase 4 note (not built yet):** a value >100% is _fleeting_ — the instant price
 > exceeds the peak, the MV bumps the peak and the ratio falls back to ~100%, so the gauge
-> never *sits* above 100%. The future "new all-time high" alert must catch the **event**
+> never _sits_ above 100%. The future "new all-time high" alert must catch the **event**
 > (price crossed the old peak) at the moment it happens, not poll the gauge state.
 
 ```bash
@@ -155,7 +156,7 @@ shows, per coin, the **price** line and a **moving-average** line on top of it �
 is above its MA it's trending up vs its recent average, and vice versa.
 
 **Why a direct query, not a materialized view (the key contrast with peak):** a rolling
-average needs *history* — to average the last N minutes you must look back over many rows.
+average needs _history_ — to average the last N minutes you must look back over many rows.
 A ClickHouse MV only ever sees the single block being inserted, so it **cannot** compute a
 rolling window. Peak works as an MV because `max` is monotonic and per-block; a moving
 average is not. So the MA is a **direct windowed query Grafana runs on each refresh** —
@@ -188,7 +189,7 @@ ORDER BY time
 
 ## Pipeline health monitoring & alerting
 
-Dashboards are *passive* — they only help if someone is looking. A streaming pipeline needs
+Dashboards are _passive_ — they only help if someone is looking. A streaming pipeline needs
 **active** monitoring that notices a stall on its own and alerts, before a stakeholder sees
 stale numbers. (Same shape as watching an industrial sensor-telemetry stream for dropouts.)
 The `healthcheck` service ([healthcheck/health_check.py](healthcheck/health_check.py)) runs
@@ -196,15 +197,17 @@ on a schedule and writes results to **`crypto.health_checks`**; Grafana reads th
 both **show** health and **alert** on it.
 
 **Two checks (each catches what the other misses):**
+
 - **Freshness (overall):** `now() − max(trade_time)`. If the newest trade is older than
   `FRESHNESS_THRESHOLD_SECONDS` (default 120s) → `STALE` = the whole pipeline stopped.
-- **Per-symbol stall:** last-trade age for *each* symbol. If one symbol exceeds
+- **Per-symbol stall:** last-trade age for _each_ symbol. If one symbol exceeds
   `SYMBOL_STALL_THRESHOLD_SECONDS` (default 300s) → `STALLED`. This catches a **partial**
   failure the overall check can't: overall `max()` is dominated by the busiest coin, so BTC
   flowing happily hides a silently-dead XRP subscription. Only the per-symbol view sees it.
 
 **Design choices (the "why"):**
-- **A 5-minute sleep-loop, not Airflow.** This is *one* periodic job with no dependency
+
+- **A 5-minute sleep-loop, not Airflow.** This is _one_ periodic job with no dependency
   graph. Airflow (scheduler + webserver + metadata DB + workers) earns its keep on multi-step
   DAGs with retries/backfills — over-engineering for a single recurring check. Reach for it
   when the dependency graph appears, not before.
@@ -224,6 +227,121 @@ and the rules in Grafana → Alerting. Thresholds: `HEALTH_CHECK_INTERVAL_SECOND
 
 ---
 
+## Benchmark (single-node)
+
+Binance's real feed is only tens of events/sec — far too low to find the pipeline's limits.
+So `loadgen` ([loadgen/loadgen.py](loadgen/loadgen.py)) pushes **synthetic** trades (same
+schema) into Kafka at a controllable rate, and we measure end-to-end.
+
+```bash
+docker compose stop producer             # measure clean synthetic load, not a mix
+make loadtest RATE=10000 DURATION=60      # push 10k events/s for 60s (one generator)
+make bench-latency                        # p50/p95/p99/max of (ingested_at − trade_time)
+make bench-lag                            # consumer-group lag (growing = can't keep up)
+docker compose start producer             # resume the real feed afterwards
+```
+
+A single generator process tops out near ~50k/s, so for higher rates run **two in parallel**
+(distinct `LOADTEST_INSTANCE` so their `trade_id`s don't overlap and dedup away):
+
+```bash
+docker compose run --rm -e LOADTEST_INSTANCE=0 -e LOADTEST_RATE=50000 -e LOADTEST_DURATION=50 loadgen &
+docker compose run --rm -e LOADTEST_INSTANCE=1 -e LOADTEST_RATE=50000 -e LOADTEST_DURATION=50 loadgen &
+```
+
+### Headline — **100,000 events/s end-to-end, p99 ≈ 613 ms, single node**
+
+…reached by two compounding optimizations from a 1-consumer baseline. Measured on the dev
+box (Docker engine: **16 vCPU, ~13.5 GB, WSL2**); single Kafka broker, topic `trades` 3
+partitions, `ReplacingMergeTree` + `Decimal64(8)`, `FLUSH_INTERVAL=2s`.
+
+**Baseline — 1 consumer, `BATCH_SIZE=1000`:**
+
+| Push rate |   p50 |    p95 |    **p99** |     max | Verdict           |
+| --------: | ----: | -----: | ---------: | ------: | ----------------- |
+| 10,000 /s | 77 ms | 124 ms | **136 ms** | 2.6 s\* | healthy           |
+| 30,000 /s | 46 ms |  96 ms | **168 ms** |  213 ms | healthy           |
+| 50,000 /s | 3.7 s |  8.2 s |  **8.8 s** |  10.0 s | ceiling exceeded  |
+
+<sub>\*the lone 2.6 s max at 10k was a first-batch/cold outlier; p99 is the honest figure.</sub>
+
+**Optimization journey — two levers to 100k:**
+
+| Config                              | Drain ceiling |  50k p99 |     100k p99 |
+| ----------------------------------- | ------------: | -------: | -----------: |
+| 1 consumer · batch 1000             |     ~47–50k/s |   8.8 s  |            — |
+| **3 consumers** · batch 1000        |       ~80k/s  | **125 ms** |       15 s  |
+| **3 consumers · batch 10000**       |   ~100–130k/s |        — | **613 ms** ✅ |
+
+1. **Horizontal scaling** — `docker compose up -d --scale consumer=3`. All instances share
+   the consumer group, so Kafka gives each one partition (≤1 per instance). Fixed the
+   *parallelism* bottleneck: 50k went from 8.8 s → **125 ms**.
+2. **Batch size 1000 → 10000** — 10× fewer, bigger ClickHouse inserts. Fixed the *per-insert
+   overhead* bottleneck: 100k went from 15 s → **613 ms**, landing ~100–130k rows/s with
+   consumer lag draining to 0.
+
+This also makes the **latency/throughput trade-off** concrete: bigger batches buy throughput
+by letting events wait a little longer to fill — p99 rose from 125 ms (batch 1000 @ 50k) to
+613 ms (batch 10000 @ 100k), still comfortably sub-second.
+
+### What breaks first, and the ceiling
+
+The bottleneck is the **consumer's consume→insert throughput**, *not* ClickHouse: **zero
+`TOO_MANY_PARTS`** even at 100k/s (batching held), and Kafka happily buffered any backlog.
+So the scale path is horizontal. Two ceilings to know:
+
+- **Partition cap.** We **key by symbol**, and `partition = hash(symbol) % N`. With **5
+  symbols** at most 5 partitions ever carry data — so useful parallelism caps near **5
+  consumers**. Going beyond needs more symbols, or a different partition key (which would
+  cost per-symbol ordering).
+- **Host CPU.** On this box the 2 load generators share 16 vCPU with 3 consumers +
+  ClickHouse + Kafka, so the *measurement itself* competes for cores. A dedicated machine
+  (the home server below) sees a higher ceiling.
+
+### Why these numbers are honest
+
+- **Latency clock starts at Kafka entry, not Binance.** `loadgen` stamps `trade_time` at
+  publish, so `ingested_at − trade_time` excludes external network we don't control.
+- **p99, not average.** The average hides the tail; p99 is what a production SLA promises —
+  at 50k/s (1 consumer) the _average_ still looks okay while p99 had already blown out to seconds.
+- **No dedup illusion.** unique `trade_id`s (per generator instance) mean `ReplacingMergeTree`
+  doesn't collapse rows — we measure real insert work. (`LOADTEST_DUP_MODE=1` measures dedup
+  overhead separately.)
+- **Warmed up + context reported** (cores/RAM, batch size, partitions, consumer count).
+
+> Honest-with-context beats impressive-but-vague: _"100k events/s, p99 613 ms, single node;
+> reached by scaling consumers to the partition count + tuning batch size; bottleneck is the
+> consumer insert path, parallelism capped by partition key."_
+
+### Reproduce on the home server (Ubuntu 48 GB)
+
+`make` is available on the server (unlike the Windows dev box), so the targets work directly.
+With more RAM and dedicated cores, expect a higher ceiling than the dev-box numbers above.
+
+```bash
+git pull
+# 100k profile: bigger batches + 3 consumers
+echo "BATCH_SIZE=10000" >> .env                 # or edit .env
+docker compose up -d --build                    # bring the stack up
+docker compose up -d --scale consumer=3 consumer # 3 consumers (one per partition)
+
+docker compose stop producer                    # clean benchmark
+# two generators in parallel ≈ 100k/s for 50s:
+docker compose run --rm -e LOADTEST_INSTANCE=0 -e LOADTEST_RATE=50000 -e LOADTEST_DURATION=50 loadgen &
+docker compose run --rm -e LOADTEST_INSTANCE=1 -e LOADTEST_RATE=50000 -e LOADTEST_DURATION=50 loadgen &
+wait
+make bench-latency                              # p50/p95/p99 during/just after the run
+make bench-lag                                  # confirm lag drains to 0
+docker compose start producer                   # resume the real feed
+```
+
+> Tip: to make 3 consumers the permanent default (so a plain `docker compose up` starts
+> three), add `deploy: { replicas: 3 }` to the `consumer` service instead of `--scale`. For
+> the *true* ceiling, run `loadgen` from a **separate** machine so the generator doesn't
+> steal cores from the pipeline it's measuring.
+
+---
+
 ## Project layout
 
 ```
@@ -231,7 +349,7 @@ and the rules in Grafana → Alerting. Thresholds: `HEALTH_CHECK_INTERVAL_SECOND
 ├── docker-compose.yml          # the single orchestrator (8 services + seeder tool)
 ├── .env.example                # documented config template (copy to .env)
 ├── .gitignore
-├── Makefile                    # up / down / logs / ps / topic / query / seed-peaks / peaks / dedup-check / clean
+├── Makefile                    # up / logs / seed-peaks / dedup-check / loadtest / bench-* / clean …
 ├── producer/                   # Binance WS → Kafka
 │   ├── Dockerfile
 │   ├── requirements.txt
@@ -248,6 +366,10 @@ and the rules in Grafana → Alerting. Thresholds: `HEALTH_CHECK_INTERVAL_SECOND
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── health_check.py
+├── loadgen/                    # benchmark: synthetic load at a controllable rate
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── loadgen.py
 ├── clickhouse/
 │   └── init/
 │       ├── 01_schema.sql        # crypto.trades (ReplacingMergeTree, Decimal, trade_id)
@@ -294,10 +416,10 @@ make seed-peaks       # fetch historical highs from Binance, populate crypto.pea
 
 Then open:
 
-| URL | What |
-|---|---|
+| URL                   | What                                                                                                                                     |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | http://localhost:3000 | **Grafana** → **Crypto Live** · **Crypto Peak Tracking** · **Crypto Trend** · **Pipeline Health** (+ Alerting) — login `admin` / `admin` |
-| http://localhost:8080 | **Kafka UI** → cluster `crypto-local` → topic `trades`, watch messages |
+| http://localhost:8080 | **Kafka UI** → cluster `crypto-local` → topic `trades`, watch messages                                                                   |
 
 Useful commands:
 
@@ -348,22 +470,22 @@ volumes (`kafka_data`, `clickhouse_data`, `grafana_data`) persist data across
 Everything is read from `.env` (see `.env.example`). Compose falls back to the
 defaults below if a var is unset, so the stack also boots with no `.env`.
 
-| Variable | Default | Meaning |
-|---|---|---|
-| `SYMBOLS` | `BTCUSDT,ETHUSDT` | Comma-separated Binance symbols to stream. |
-| `BINANCE_WS_BASE` | `wss://stream.binance.com:9443` | Binance market-stream base URL. |
-| `KAFKA_BROKER` | `kafka:9092` | Broker address used **inside** the network (INTERNAL listener; host uses `localhost:19092`). |
-| `KAFKA_TOPIC` | `trades` | Topic the producer writes and consumer reads. |
-| `KAFKA_GROUP_ID` | `clickhouse-writer` | Consumer group (offsets tracked per group). |
-| `CLICKHOUSE_HOST` | `clickhouse` | ClickHouse hostname on the compose network. |
-| `CLICKHOUSE_PORT` | `8123` | HTTP port the **consumer** uses (Grafana uses native `9000`). |
-| `CLICKHOUSE_DB` | `crypto` | Database name. |
-| `CLICKHOUSE_TABLE` | `trades` | Table name. |
-| `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD` | `default` / *(empty)* | Credentials. |
-| `BATCH_SIZE` | `1000` | Flush to ClickHouse once this many rows are buffered… |
-| `FLUSH_INTERVAL_SECONDS` | `2` | …or this many seconds pass — whichever first. |
-| `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD` | `admin` / `admin` | Grafana login. |
-| `LOG_LEVEL` | `INFO` | `DEBUG`/`INFO`/`WARNING`/`ERROR` for producer & consumer. |
+| Variable                                        | Default                         | Meaning                                                                                      |
+| ----------------------------------------------- | ------------------------------- | -------------------------------------------------------------------------------------------- |
+| `SYMBOLS`                                       | `BTCUSDT,ETHUSDT`               | Comma-separated Binance symbols to stream.                                                   |
+| `BINANCE_WS_BASE`                               | `wss://stream.binance.com:9443` | Binance market-stream base URL.                                                              |
+| `KAFKA_BROKER`                                  | `kafka:9092`                    | Broker address used **inside** the network (INTERNAL listener; host uses `localhost:19092`). |
+| `KAFKA_TOPIC`                                   | `trades`                        | Topic the producer writes and consumer reads.                                                |
+| `KAFKA_GROUP_ID`                                | `clickhouse-writer`             | Consumer group (offsets tracked per group).                                                  |
+| `CLICKHOUSE_HOST`                               | `clickhouse`                    | ClickHouse hostname on the compose network.                                                  |
+| `CLICKHOUSE_PORT`                               | `8123`                          | HTTP port the **consumer** uses (Grafana uses native `9000`).                                |
+| `CLICKHOUSE_DB`                                 | `crypto`                        | Database name.                                                                               |
+| `CLICKHOUSE_TABLE`                              | `trades`                        | Table name.                                                                                  |
+| `CLICKHOUSE_USER` / `CLICKHOUSE_PASSWORD`       | `default` / _(empty)_           | Credentials.                                                                                 |
+| `BATCH_SIZE`                                    | `1000`                          | Flush to ClickHouse once this many rows are buffered…                                        |
+| `FLUSH_INTERVAL_SECONDS`                        | `2`                             | …or this many seconds pass — whichever first.                                                |
+| `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD` | `admin` / `admin`               | Grafana login.                                                                               |
+| `LOG_LEVEL`                                     | `INFO`                          | `DEBUG`/`INFO`/`WARNING`/`ERROR` for producer & consumer.                                    |
 
 > Changing `CLICKHOUSE_DB`/`CLICKHOUSE_TABLE` works automatically: the dashboard
 > queries are unqualified (`FROM trades`) and resolve against the datasource's
@@ -374,6 +496,7 @@ defaults below if a var is unset, so the stack also boots with no `.env`.
 ## How it works (the three ideas worth understanding)
 
 ### 1. Why the consumer batches inserts
+
 ClickHouse's `MergeTree` writes every `INSERT` as an immutable **part** (a folder of
 column files) and merges parts in the background. One insert per trade → thousands
 of tiny parts → merge storms and the dreaded `TOO_MANY_PARTS` error. So the consumer
@@ -383,7 +506,9 @@ buffers rows and writes them in one shot, flushing on **`BATCH_SIZE` rows OR
 See [consumer/consumer.py](consumer/consumer.py).
 
 ### 2. Why these ClickHouse types
+
 See [clickhouse/init/01_schema.sql](clickhouse/init/01_schema.sql).
+
 - `symbol LowCardinality(String)` — only a few distinct values → dictionary-encoded, smaller & faster.
 - `trade_id UInt64` — Binance's per-symbol trade id (field `t`); the **dedup key** (Phase 3).
 - `price/quantity Decimal64(8)` — exact money to Binance's 8 dp (Phase 3, was Float64). Parsed from the raw string, never via float.
@@ -392,8 +517,10 @@ See [clickhouse/init/01_schema.sql](clickhouse/init/01_schema.sql).
 - `ENGINE = ReplacingMergeTree(ingested_at)`, `ORDER BY (symbol, trade_id)` — collapses duplicate `(symbol, trade_id)` rows at merge time. Day-`PARTITION` still prunes time-range scans.
 
 ### 3. How the WebSocket reconnect works
+
 Binance **will** drop the socket (~24h connection cap, plus transient blips), so the
 producer treats disconnects as routine. See [producer/producer.py](producer/producer.py):
+
 - An outer supervisor loop reconnects forever with **exponential backoff + jitter**
   (`base·2^attempt`, capped, plus randomness to avoid thundering herds), resetting the
   backoff once a connection actually delivers data.
@@ -403,11 +530,12 @@ producer treats disconnects as routine. See [producer/producer.py](producer/prod
   socket and forces a reconnect.
 
 ### Delivery semantics — effectively-once via idempotent writes (Phase 3)
+
 Kafka delivery stays **at-least-once**: the consumer disables auto-commit and commits
-offsets *only after* a batch lands in ClickHouse, so a crash mid-batch makes it re-read
+offsets _only after_ a batch lands in ClickHouse, so a crash mid-batch makes it re-read
 and **re-insert** those messages. True distributed exactly-once is near-impossible, so
 instead we make the **write idempotent** — reprocessing the same trades yields the same
-final result (*effectively-once*):
+final result (_effectively-once_):
 
 - Each trade carries Binance's **`trade_id`** (field `t`), unique per symbol.
 - `crypto.trades` is **`ReplacingMergeTree(ingested_at)`** with `ORDER BY (symbol, trade_id)`.
@@ -417,12 +545,12 @@ final result (*effectively-once*):
   `GROUP BY`) is dedup-correct. Force it now with `OPTIMIZE TABLE crypto.trades FINAL`.
 - **Money is `Decimal64(8)`**, not Float64 — exact to Binance's 8 dp. The producer forwards
   the raw price **string**, the consumer parses it straight into `Decimal` (no float between).
-- **Peak still works:** the peak MV runs at *insert* time (before dedup), so it sees a
+- **Peak still works:** the peak MV runs at _insert_ time (before dedup), so it sees a
   reprocessed trade twice — but `max(x, x) = x`, so duplicates can't change the peak. (This
   is safe for `max` only; `sum`/`count` would over-count and need `FINAL` input.)
 
 **Producer side — no silent loss into Kafka** (`producer/producer.py`): `produce()` only
-*queues* locally (a background thread sends), so durability needs config, not luck:
+_queues_ locally (a background thread sends), so durability needs config, not luck:
 `acks=all` (broker persists before acking), `enable.idempotence=true` (broker drops dups
 from the producer's own retries), `delivery.timeout.ms` (bounded retry budget, then the
 **delivery callback reports failure** — counted, never dropped silently), and a
@@ -468,12 +596,12 @@ before exit.
 - **No trades / producer reconnect loop:** verify outbound HTTPS/WSS to Binance is
   allowed from the host; some regions geo-block — try
   `BINANCE_WS_BASE=wss://data-stream.binance.vision` in `.env`.
-- **Schema didn't apply:** init SQL runs only on a *fresh* ClickHouse volume. After
+- **Schema didn't apply:** init SQL runs only on a _fresh_ ClickHouse volume. After
   changing it, `make clean` to wipe and re-init. (The consumer also creates the table
   idempotently on startup as a safety net.)
 - **Peak gauge empty / `peak_prices` doesn't exist:** on an already-running ClickHouse the
   init `02_peak.sql` won't re-run — `make seed-peaks` applies the peak schema (table + MV)
-  *and* seeds it. Run it once after `up`.
+  _and_ seeds it. Run it once after `up`.
 - **Seeded peaks look tiny / wrong:** the kline `high` is index 2 of each array; a tiny
   number means it's being read from the wrong field. If you get **HTTP 451**, Binance is
   geo-blocking — set `BINANCE_REST_BASE=https://data-api.binance.vision` in `.env`.

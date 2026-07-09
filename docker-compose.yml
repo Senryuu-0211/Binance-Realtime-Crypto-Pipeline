@@ -253,7 +253,10 @@ services:
   # ---------------------------------------------------------------------------
   consumer:
     build: ./consumer
-    container_name: crypto-consumer
+    # NOTE: no container_name here on purpose — a fixed name blocks scaling.
+    # All instances share KAFKA_GROUP_ID, so Kafka rebalances the topic's
+    # partitions across them (≤1 partition per instance). Scale up to the
+    # partition count: `docker compose up -d --scale consumer=3`.
     environment:
       KAFKA_BROKER: ${KAFKA_BROKER:-kafka:9092}
       KAFKA_TOPIC: ${KAFKA_TOPIC:-trades}
@@ -278,7 +281,10 @@ services:
 
   # ---------------------------------------------------------------------------
   # 8) Healthcheck — scheduled pipeline monitoring (every CHECK_INTERVAL).
-  #    Writes freshness + per-symbol-stall results into crypto.health_checks;
+  #    Writes three check types into crypto.health_checks:
+  #      - freshness (overall end-to-end lag)
+  #      - per-symbol stall (partial stream failure)
+  #      - trade-ID gap (missing events from WebSocket disconnects)
   #    Grafana reads that table to display health and fire alerts (in-stack, no
   #    external Slack/SMTP). A simple sleep-loop, NOT Airflow — one periodic job.
   # ---------------------------------------------------------------------------
@@ -290,6 +296,7 @@ services:
       CHECK_INTERVAL_SECONDS: ${HEALTH_CHECK_INTERVAL_SECONDS:-300}
       FRESHNESS_THRESHOLD_SECONDS: ${FRESHNESS_THRESHOLD_SECONDS:-120}
       SYMBOL_STALL_THRESHOLD_SECONDS: ${SYMBOL_STALL_THRESHOLD_SECONDS:-300}
+      GAP_CHECK_WINDOW_MINUTES: ${GAP_CHECK_WINDOW_MINUTES:-10}
       CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-clickhouse}
       CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-8123}
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-crypto}
@@ -324,6 +331,28 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
       clickhouse:
+        condition: service_healthy
+
+  # ---------------------------------------------------------------------------
+  # 10) Loadgen — ONE-OFF benchmark tool: push synthetic trades into Kafka at a
+  #     controllable rate. `profiles: [tools]` => not started by `up`. Run via
+  #     `make loadtest RATE=10000`. STOP the real producer first for clean numbers.
+  # ---------------------------------------------------------------------------
+  loadgen:
+    build: ./loadgen
+    # no container_name — so you can run several in parallel (e.g. 2x 50k for 100k/s)
+    profiles: ["tools"]
+    environment:
+      KAFKA_BROKER: ${KAFKA_BROKER:-kafka:9092}
+      KAFKA_TOPIC: ${KAFKA_TOPIC:-trades}
+      SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT,BNBUSDT,XRPUSDT,SOLUSDT}
+      LOADTEST_RATE: ${LOADTEST_RATE:-10000}
+      LOADTEST_DURATION: ${LOADTEST_DURATION:-60}
+      LOADTEST_DUP_MODE: ${LOADTEST_DUP_MODE:-0}
+      LOADTEST_INSTANCE: ${LOADTEST_INSTANCE:-0}   # set distinct ids when running parallel loadgens
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      kafka:
         condition: service_healthy
 
 # Named volumes persist data across `docker compose down` (use `down -v` to wipe).

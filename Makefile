@@ -8,7 +8,11 @@
 # Use the v2 plugin syntax (`docker compose`, not the old `docker-compose`).
 COMPOSE := docker compose
 
-.PHONY: help up down restart logs logs-producer logs-consumer ps build topic query seed-peaks peaks dedup-check clean
+# Benchmark knobs (override on the CLI, e.g. `make loadtest RATE=30000 DURATION=45`).
+RATE ?= 10000
+DURATION ?= 60
+
+.PHONY: help up down restart logs logs-producer logs-consumer ps build topic query seed-peaks peaks dedup-check loadtest bench-latency bench-throughput bench-lag clean
 
 help:            ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -59,6 +63,29 @@ dedup-check:     ## Raw count (may include dups) vs FINAL count (dedup'd) per sy
 	@echo "-- after dedup (FINAL): --"
 	$(COMPOSE) exec clickhouse clickhouse-client --query \
 		"SELECT symbol, count() AS final_rows FROM crypto.trades FINAL GROUP BY symbol ORDER BY symbol"
+
+loadtest:        ## Push synthetic load: make loadtest RATE=10000 DURATION=60 (stop the real producer first!)
+	$(COMPOSE) run --rm --build -e LOADTEST_RATE=$(RATE) -e LOADTEST_DURATION=$(DURATION) loadgen
+
+bench-latency:   ## End-to-end latency percentiles (ms) over the last 2 minutes
+	$(COMPOSE) exec clickhouse clickhouse-client --query \
+		"SELECT count() AS events, \
+		        round(quantile(0.50)(lat),1) AS p50_ms, \
+		        round(quantile(0.95)(lat),1) AS p95_ms, \
+		        round(quantile(0.99)(lat),1) AS p99_ms, \
+		        max(lat) AS max_ms \
+		 FROM (SELECT toUnixTimestamp64Milli(ingested_at) - toUnixTimestamp64Milli(trade_time) AS lat \
+		       FROM crypto.trades WHERE ingested_at > now() - INTERVAL 2 MINUTE) \
+		 FORMAT Vertical"
+
+bench-throughput: ## Rows landed per second over the last minute (sustained ingest rate)
+	$(COMPOSE) exec clickhouse clickhouse-client --query \
+		"SELECT count() AS rows_1min, round(count() / 60, 0) AS rows_per_sec \
+		 FROM crypto.trades WHERE ingested_at > now() - INTERVAL 1 MINUTE"
+
+bench-lag:       ## Consumer-group lag (growing unbounded = pipeline can't keep up)
+	$(COMPOSE) exec kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+		--bootstrap-server kafka:9092 --describe --group $${KAFKA_GROUP_ID:-clickhouse-writer}
 
 clean:           ## Stop everything AND delete data volumes (full reset)
 	$(COMPOSE) down -v
