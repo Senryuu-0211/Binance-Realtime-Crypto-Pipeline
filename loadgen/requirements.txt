@@ -3,3 +3,8 @@
 # Same Kafka client as the real producer (wraps librdkafka, C) — fast enough to
 # generate tens of thousands of events/sec from one process.
 confluent-kafka==2.5.3
+
+# Avro + Schema Registry: loadgen encodes with the SAME schema as the producer,
+# so synthetic load exercises the real serialize/deserialize path.
+fastavro==1.9.7
+requests==2.32.3

@@ -144,6 +144,50 @@ services:
     restart: "no"
 
   # ---------------------------------------------------------------------------
+  # 2b) Schema Registry — the CONTRACT store for message schemas.
+  #
+  #     WHY: right now producer & consumer agree on the JSON shape only by
+  #     convention — nothing STOPS the producer from renaming a field or changing
+  #     a type and silently breaking every downstream reader. Schema Registry makes
+  #     the message schema an explicit, versioned CONTRACT: producers register an
+  #     Avro schema, the registry assigns it an id, and every message carries that
+  #     id (Confluent wire format: magic byte + 4-byte schema id + Avro payload).
+  #     Consumers fetch the exact writer schema by id — no local schema copy needed.
+  #
+  #     GOVERNANCE: the registry ENFORCES a compatibility rule on every new schema
+  #     version. With BACKWARD (set below), you may add a field WITH A DEFAULT or
+  #     remove one, but you may NOT add a required field or change a type — such a
+  #     change is REJECTED at registration, so a breaking schema never reaches the
+  #     topic. That's the "schema evolution stays safe" guarantee.
+  #
+  #     Confluent's registry speaks to ANY Kafka broker (works with our apache/kafka
+  #     KRaft broker); it stores schemas in an internal compacted `_schemas` topic,
+  #     forced to replication-factor 1 for our single broker.
+  # ---------------------------------------------------------------------------
+  schema-registry:
+    image: confluentinc/cp-schema-registry:7.7.1
+    container_name: crypto-schema-registry
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      SCHEMA_REGISTRY_HOST_NAME: schema-registry
+      SCHEMA_REGISTRY_LISTENERS: http://0.0.0.0:8081
+      # Where the registry stores its schemas (the broker + the _schemas topic).
+      SCHEMA_REGISTRY_KAFKASTORE_BOOTSTRAP_SERVERS: PLAINTEXT://kafka:9092
+      SCHEMA_REGISTRY_KAFKASTORE_TOPIC_REPLICATION_FACTOR: 1
+      # Global compatibility policy new schema versions must satisfy (see note above).
+      SCHEMA_REGISTRY_SCHEMA_COMPATIBILITY_LEVEL: backward
+    ports:
+      - "8081:8081"     # REST API: http://localhost:8081/subjects
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8081/subjects"]
+      interval: 10s
+      timeout: 5s
+      retries: 15
+      start_period: 20s
+
+  # ---------------------------------------------------------------------------
   # 3) Kafka UI — web UI to WATCH topics, messages, and consumer-group lag.
   #    (Provectus kafka-ui — works with plain Kafka over the standard protocol;
   #    pinned to v0.7.2. The actively-maintained successor is kafbat/kafka-ui if
@@ -155,11 +199,16 @@ services:
     environment:
       KAFKA_CLUSTERS_0_NAME: crypto-local
       KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+      # Point the UI at the registry so it can DECODE Avro messages and show the
+      # registered schemas + versions under the Schema Registry tab.
+      KAFKA_CLUSTERS_0_SCHEMAREGISTRY: http://schema-registry:8081
       DYNAMIC_CONFIG_ENABLED: "true"
     ports:
       - "8080:8080"     # open http://localhost:8080 -> Topics -> trades
     depends_on:
       kafka:
+        condition: service_healthy
+      schema-registry:
         condition: service_healthy
 
   # ---------------------------------------------------------------------------
@@ -234,6 +283,7 @@ services:
     environment:
       KAFKA_BROKER: ${KAFKA_BROKER:-kafka:9092}
       KAFKA_TOPIC: ${KAFKA_TOPIC:-trades}
+      SCHEMA_REGISTRY_URL: ${SCHEMA_REGISTRY_URL:-http://schema-registry:8081}
       SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT}
       BINANCE_WS_BASE: ${BINANCE_WS_BASE:-wss://stream.binance.com:9443}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -242,6 +292,8 @@ services:
         condition: service_healthy
       kafka-init:                       # wait until the 'trades' topic exists
         condition: service_completed_successfully
+      schema-registry:                  # need the registry up to register/serialize Avro
+        condition: service_healthy
     restart: unless-stopped
     # Give the graceful-shutdown flush() room to finish before Docker SIGKILLs
     # (default grace is only 10s). On `docker compose stop` the producer catches
@@ -261,6 +313,7 @@ services:
       KAFKA_BROKER: ${KAFKA_BROKER:-kafka:9092}
       KAFKA_TOPIC: ${KAFKA_TOPIC:-trades}
       KAFKA_GROUP_ID: ${KAFKA_GROUP_ID:-clickhouse-writer}
+      SCHEMA_REGISTRY_URL: ${SCHEMA_REGISTRY_URL:-http://schema-registry:8081}
       CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-clickhouse}
       CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-8123}
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-crypto}
@@ -276,6 +329,8 @@ services:
       kafka-init:
         condition: service_completed_successfully
       clickhouse:
+        condition: service_healthy
+      schema-registry:                  # need the registry to deserialize Avro
         condition: service_healthy
     restart: unless-stopped
 
@@ -300,6 +355,44 @@ services:
       CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-clickhouse}
       CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-8123}
       CLICKHOUSE_DB: ${CLICKHOUSE_DB:-crypto}
+      CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
+      CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
+      LOG_LEVEL: ${LOG_LEVEL:-INFO}
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------------------------------------------------------------------------
+  # 8b) Backfiller — SELF-HEALING remediation for the gap the healthcheck detects.
+  #
+  #     The healthcheck DETECTS missing trade_ids (events lost at the WebSocket
+  #     edge during a reconnect); this service REMEDIATES them: every interval it
+  #     scans the recent window for gaps and re-fetches the exact missing trades
+  #     from Binance's /api/v3/historicalTrades (raw-trade ids that match our
+  #     dedup key — NOT /aggTrades). That closes the last no-data-loss hole.
+  #
+  #     Always-on (part of `up`), but it needs an API key: historicalTrades is a
+  #     MARKET_DATA endpoint. With NO BINANCE_API_KEY it logs "disabled" and idles
+  #     harmlessly — `docker compose up` still works, detection still runs; only
+  #     auto-healing is off. Re-inserting is idempotent (ReplacingMergeTree), so
+  #     repeated/overlapping runs can't double-count. For a manual one-shot pass:
+  #     `make backfill` (runs with BACKFILL_ONCE=1).
+  # ---------------------------------------------------------------------------
+  backfiller:
+    build: ./backfiller
+    container_name: crypto-backfiller
+    environment:
+      SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT}      # same coins as the producer
+      BINANCE_REST_BASE: ${BINANCE_REST_BASE:-https://api.binance.com}
+      BINANCE_API_KEY: ${BINANCE_API_KEY:-}     # REQUIRED for /historicalTrades; empty => idle
+      BACKFILL_INTERVAL_SECONDS: ${BACKFILL_INTERVAL_SECONDS:-300}
+      BACKFILL_WINDOW_MINUTES: ${BACKFILL_WINDOW_MINUTES:-15}
+      BACKFILL_MAX_GAP: ${BACKFILL_MAX_GAP:-500000}
+      CLICKHOUSE_HOST: ${CLICKHOUSE_HOST:-clickhouse}
+      CLICKHOUSE_PORT: ${CLICKHOUSE_PORT:-8123}
+      CLICKHOUSE_DB: ${CLICKHOUSE_DB:-crypto}
+      CLICKHOUSE_TABLE: ${CLICKHOUSE_TABLE:-trades}
       CLICKHOUSE_USER: ${CLICKHOUSE_USER:-default}
       CLICKHOUSE_PASSWORD: ${CLICKHOUSE_PASSWORD:-}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
@@ -345,6 +438,7 @@ services:
     environment:
       KAFKA_BROKER: ${KAFKA_BROKER:-kafka:9092}
       KAFKA_TOPIC: ${KAFKA_TOPIC:-trades}
+      SCHEMA_REGISTRY_URL: ${SCHEMA_REGISTRY_URL:-http://schema-registry:8081}
       SYMBOLS: ${SYMBOLS:-BTCUSDT,ETHUSDT,BNBUSDT,XRPUSDT,SOLUSDT}
       LOADTEST_RATE: ${LOADTEST_RATE:-10000}
       LOADTEST_DURATION: ${LOADTEST_DURATION:-60}
@@ -353,6 +447,8 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
     depends_on:
       kafka:
+        condition: service_healthy
+      schema-registry:                  # loadgen must Avro-encode like the real producer
         condition: service_healthy
 
 # Named volumes persist data across `docker compose down` (use `down -v` to wipe).

@@ -1,0 +1,33 @@
+{
+  "type": "record",
+  "name": "Trade",
+  "namespace": "crypto.trades",
+  "doc": "One Binance trade tick. This is the VERSIONED CONTRACT between the producer and every consumer: it is registered in Schema Registry as the subject 'trades-value', and the registry rejects any future version that isn't BACKWARD-compatible with it (see docker-compose schema-registry).",
+  "fields": [
+    {
+      "name": "symbol",
+      "type": "string",
+      "doc": "Trading pair, e.g. BTCUSDT. Also used as the Kafka message key (partitioning + per-symbol ordering)."
+    },
+    {
+      "name": "trade_id",
+      "type": "long",
+      "doc": "Binance per-symbol trade id (field 't'). Monotonic per symbol; our dedup key and gap-detection sequence. Fits a signed 64-bit long (well under 2^63)."
+    },
+    {
+      "name": "price",
+      "type": "string",
+      "doc": "Price as the EXACT decimal STRING Binance sent (e.g. '64123.45000000'). Kept as a string on purpose: Avro's float/double would lose precision, and even the decimal logical type would force us to pick a scale here. The sink parses this straight into ClickHouse Decimal64(8), so no float ever touches the money value end-to-end."
+    },
+    {
+      "name": "quantity",
+      "type": "string",
+      "doc": "Trade quantity as the exact decimal string (same reasoning as price)."
+    },
+    {
+      "name": "trade_time",
+      "type": "long",
+      "doc": "Event time from Binance (field 'T'), epoch MILLISECONDS. Maps to ClickHouse DateTime64(3)."
+    }
+  ]
+}

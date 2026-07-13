@@ -12,7 +12,7 @@ COMPOSE := docker compose
 RATE ?= 10000
 DURATION ?= 60
 
-.PHONY: help up down restart logs logs-producer logs-consumer ps build topic query seed-peaks peaks dedup-check loadtest bench-latency bench-throughput bench-lag clean
+.PHONY: help up down restart logs logs-producer logs-consumer logs-backfiller ps build topic query seed-peaks peaks dedup-check backfill gaps loadtest bench-latency bench-throughput bench-lag clean
 
 help:            ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
@@ -35,6 +35,9 @@ logs-producer:   ## Tail only the producer
 
 logs-consumer:   ## Tail only the consumer
 	$(COMPOSE) logs -f consumer
+
+logs-backfiller: ## Tail only the backfiller (self-healing gap remediation)
+	$(COMPOSE) logs -f backfiller
 
 ps:              ## Show service status / health
 	$(COMPOSE) ps
@@ -63,6 +66,18 @@ dedup-check:     ## Raw count (may include dups) vs FINAL count (dedup'd) per sy
 	@echo "-- after dedup (FINAL): --"
 	$(COMPOSE) exec clickhouse clickhouse-client --query \
 		"SELECT symbol, count() AS final_rows FROM crypto.trades FINAL GROUP BY symbol ORDER BY symbol"
+
+backfill:        ## Run ONE self-healing pass now (needs BINANCE_API_KEY): fill detected trade_id gaps
+	$(COMPOSE) run --rm --build -e BACKFILL_ONCE=1 backfiller
+
+gaps:            ## Show latest gap DETECTION (missing) + backfill REMEDIATION per symbol
+	$(COMPOSE) exec clickhouse clickhouse-client --query \
+		"SELECT symbol, argMax(value, checked_at) AS missing_trades, argMax(status, checked_at) AS status \
+		 FROM crypto.health_checks WHERE check_name = 'trade_gap' GROUP BY symbol ORDER BY symbol"
+	@echo "-- backfill activity (latest per symbol): --"
+	$(COMPOSE) exec clickhouse clickhouse-client --query \
+		"SELECT symbol, argMax(value, checked_at) AS backfilled, argMax(status, checked_at) AS status \
+		 FROM crypto.health_checks WHERE check_name = 'backfill' GROUP BY symbol ORDER BY symbol"
 
 loadtest:        ## Push synthetic load: make loadtest RATE=10000 DURATION=60 (stop the real producer first!)
 	$(COMPOSE) run --rm --build -e LOADTEST_RATE=$(RATE) -e LOADTEST_DURATION=$(DURATION) loadgen

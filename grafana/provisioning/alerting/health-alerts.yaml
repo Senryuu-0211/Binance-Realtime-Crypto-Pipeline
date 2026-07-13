@@ -60,6 +60,70 @@ groups:
               conditions:
                 - evaluator: { type: gt, params: [0] }
 
+      # --- Dead-man switch: WHO WATCHES THE HEALTHCHECK? ---------------------
+      # The three rules above all say noDataState:OK, so if the healthcheck
+      # SERVICE itself dies, no new rows are written -> those rules see "no data"
+      # -> they go quietly OK and blind us. A process can't reliably fire an alert
+      # about its OWN death (a crash/OOM/SIGKILL gives it no chance), so the only
+      # robust pattern is a HEARTBEAT + absence detector: the healthcheck already
+      # writes a 'freshness' row EVERY cycle (that's its heartbeat), and here we
+      # alert when that heartbeat goes STALE (its newest row is too old).
+      #
+      # Why this one CAN fire (unlike the others) after the service dies: after
+      # death the freshness rows REMAIN with an old checked_at, so max(checked_at)
+      # is a real, ageing value — the query returns data, not no-data. We look
+      # back 24h so even a long-dead healthcheck's last row is still in range.
+      # noDataState:OK only suppresses the genuine cold start (no rows ever yet).
+      # Threshold 660s = > 2 healthcheck cycles at the default 5-min interval;
+      # raise it if you increase HEALTH_CHECK_INTERVAL_SECONDS.
+      #
+      # NOTE the residual SPOF: this detector lives INSIDE the stack, so it can't
+      # alert if Grafana+ClickHouse ALSO die. Catching a whole-host outage needs a
+      # heartbeat pushed to an EXTERNAL dead-man service (Healthchecks.io, Dead
+      # Man's Snitch, PagerDuty heartbeat) — an upgrade, not a replacement.
+      - uid: health-monitor-heartbeat
+        title: Healthcheck monitor is DOWN (stale heartbeat)
+        condition: C
+        for: 0m
+        noDataState: OK               # no rows EVER yet => cold start, not a failure
+        execErrState: OK
+        labels:
+          severity: critical
+        annotations:
+          summary: >-
+            No fresh rows from the healthcheck service — it has likely crashed or
+            stalled. While it is down the STALE/STALLED/GAP alerts are BLIND, so
+            treat this as a monitoring outage and restart the healthcheck.
+        data:
+          - refId: A
+            relativeTimeRange: { from: 86400, to: 0 }
+            datasourceUid: clickhouse
+            model:
+              refId: A
+              editorType: sql
+              queryType: table
+              datasource: { type: grafana-clickhouse-datasource, uid: clickhouse }
+              # Age (seconds) of the newest heartbeat. HAVING drops the empty-table
+              # case to genuine no-data so cold start doesn't false-fire.
+              rawSql: "SELECT toFloat64(dateDiff('second', max(checked_at), now())) AS v FROM crypto.health_checks WHERE check_name = 'freshness' HAVING max(checked_at) IS NOT NULL"
+          - refId: B
+            datasourceUid: __expr__
+            model:
+              refId: B
+              type: reduce
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: A
+              reducer: last
+          - refId: C
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              datasource: { type: __expr__, uid: __expr__ }
+              expression: B
+              conditions:
+                - evaluator: { type: gt, params: [660] }
+
       # --- Per-symbol stall: is ANY single symbol's stream dead? -------------
       - uid: health-symbol-stalled
         title: A symbol stream is STALLED

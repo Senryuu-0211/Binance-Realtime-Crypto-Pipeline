@@ -5,9 +5,11 @@ ClickHouse → Grafana**. The whole thing comes up with **one `docker compose up
 on any machine — your dev box or the Ubuntu server — building everything from
 source. No pre-built images, no machine-specific paths.
 
-> **Status:** Phases 1–3 + 5 complete. Kafka KRaft · all-time peak gauge · rolling
+> **Status:** Phases 1–3.5 + 5–6 complete. Kafka KRaft · all-time peak gauge · rolling
 > moving-average · **effectively-once** ingestion (`trade_id` dedup + `ReplacingMergeTree`,
 > `Decimal64(8)`, hardened producer) · scheduled **health-check + Grafana alerting** ·
+> **self-healing** trade-ID gap detection + REST backfill (no loss at the WebSocket edge) ·
+> **schema governance** (Avro + Schema Registry, enforced BACKWARD compat) ·
 > **benchmark** (**100k events/s, p99 613 ms** single-node — via consumer scaling + batch
 > tuning). See the [Benchmark](#benchmark-single-node) section.
 
@@ -38,6 +40,9 @@ source. No pre-built images, no machine-specific paths.
                          └───────────────────────────────────────────────────────────┘
 
 Data path:   producer → Kafka → consumer → ClickHouse → Grafana
+Encoding:    messages are Avro; producer registers the schema in Schema Registry
+             (:8081), consumer fetches it back by id to decode. (Kafka UI reads
+             the registry too, so it renders Avro messages + shows the schemas.)
 Debug path:  Kafka UI (:8080) watches the topic; not part of the data path.
 
 Kafka listeners:  containers → kafka:9092 (INTERNAL)   |   host → localhost:19092 (EXTERNAL)
@@ -49,7 +54,8 @@ Kafka listeners:  containers → kafka:9092 (INTERNAL)   |   host → localhost:
 | -------------- | ------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **kafka**      | `apache/kafka` (KRaft)         | Industry-standard event-streaming backbone; strongest connector ecosystem (Kafka Connect, Schema Registry). KRaft = no ZooKeeper. Official Apache image, single broker for single-node. |
 | **kafka-init** | `apache/kafka` (one-shot)      | Creates the `trades` topic with 3 partitions / RF 1, then exits.                                                                                                                        |
-| **kafka-ui**   | `provectuslabs/kafka-ui`       | Web UI to _watch_ topics, messages, and consumer-group lag — great for learning/debugging.                                                                                              |
+| **schema-registry** | `confluentinc/cp-schema-registry` | Versioned message-schema **contract** store (Avro). Producers register the schema; consumers fetch it by id; the registry rejects breaking changes (BACKWARD compat). Works with the apache/kafka broker. |
+| **kafka-ui**   | `provectuslabs/kafka-ui`       | Web UI to _watch_ topics, messages, and consumer-group lag — great for learning/debugging. Wired to the registry so it decodes Avro + shows schemas.                                    |
 | **clickhouse** | `clickhouse/clickhouse-server` | Columnar OLAP store; fast inserts + time-range scans.                                                                                                                                   |
 | **grafana**    | `grafana/grafana`              | Dashboards, datasource + dashboard provisioned **as code**.                                                                                                                             |
 | **producer**   | built from `./producer`        | Binance WS → Kafka.                                                                                                                                                                     |
@@ -196,7 +202,7 @@ The `healthcheck` service ([healthcheck/health_check.py](healthcheck/health_chec
 on a schedule and writes results to **`crypto.health_checks`**; Grafana reads that table to
 both **show** health and **alert** on it.
 
-**Two checks (each catches what the other misses):**
+**Three checks (each catches what the others miss):**
 
 - **Freshness (overall):** `now() − max(trade_time)`. If the newest trade is older than
   `FRESHNESS_THRESHOLD_SECONDS` (default 120s) → `STALE` = the whole pipeline stopped.
@@ -204,6 +210,12 @@ both **show** health and **alert** on it.
   `SYMBOL_STALL_THRESHOLD_SECONDS` (default 300s) → `STALLED`. This catches a **partial**
   failure the overall check can't: overall `max()` is dominated by the busiest coin, so BTC
   flowing happily hides a silently-dead XRP subscription. Only the per-symbol view sees it.
+- **Trade-ID gap:** Binance stamps each trade with a per-symbol monotonic id (`t`), so a jump
+  `1000 → 1003` means ids 1001–1002 were **lost** — the WebSocket dropped for a moment and
+  those trades happened during the gap. A `lagInFrame` window query counts the missing ids per
+  symbol → `GAP_DETECTED`. Stall can't see this (the stream is flowing, just with holes); gap
+  can't see a fully-dead stream (no "after" ids) — together they cover the whole spectrum of
+  loss at the source edge.
 
 **Design choices (the "why"):**
 
@@ -220,14 +232,88 @@ both **show** health and **alert** on it.
   tune all thresholds (and the interval) via env.
 - **The monitor never crashes the pipeline:** a ClickHouse blip is logged and retried next
   cycle.
+- **Who watches the watcher? (dead-man switch).** The three checks above use `noDataState: OK`,
+  so if the healthcheck _service_ dies, no rows are written and those alerts would go silently OK —
+  blinding us. A process can't reliably announce its own death (crash/OOM gives it no chance), so a
+  fourth alert (**"Healthcheck monitor is DOWN"**) uses the opposite pattern: the healthcheck already
+  writes a `freshness` row every cycle (its **heartbeat**), and this rule fires when that heartbeat
+  goes **stale** (`now() − max(checked_at) > 660s`, i.e. > 2 cycles). After the service dies its old
+  rows remain, so the age keeps climbing and the alert fires — unlike the no-data rules. (Residual
+  SPOF: this detector is in-stack, so a whole-host outage — Grafana + ClickHouse down too — needs a
+  heartbeat pushed to an _external_ dead-man service. That's an upgrade, not a replacement.)
 
-See it on the **Pipeline Health** dashboard (freshness stat, per-symbol age table, lag-over-time),
-and the rules in Grafana → Alerting. Thresholds: `HEALTH_CHECK_INTERVAL_SECONDS`,
-`FRESHNESS_THRESHOLD_SECONDS`, `SYMBOL_STALL_THRESHOLD_SECONDS`.
+See it on the **Pipeline Health** dashboard (freshness stat, per-symbol age table, lag-over-time,
+plus trade-ID gaps), and the four rules in Grafana → Alerting. Thresholds: `HEALTH_CHECK_INTERVAL_SECONDS`,
+`FRESHNESS_THRESHOLD_SECONDS`, `SYMBOL_STALL_THRESHOLD_SECONDS`, `GAP_CHECK_WINDOW_MINUTES`.
+
+### Self-healing: from gap _detection_ to gap _remediation_
+
+Detecting lost trades is only half the story. Kafka's `acks=all` + idempotence and ClickHouse's
+dedup guarantee no loss **inside** the pipeline — but they can't recover an event we never received.
+A WebSocket is fire-and-forget at the source: whatever traded during a disconnect is simply gone
+from our stream. That was the last real no-data-loss hole.
+
+The `backfiller` service ([backfiller/backfill.py](backfiller/backfill.py)) closes it. Every
+`BACKFILL_INTERVAL_SECONDS` it scans the recent window for the exact gap **ranges** (not just
+counts) and re-fetches the missing trades from Binance's REST history, making the pipeline
+**self-healing**:
+
+- **`/api/v3/historicalTrades`, not `/aggTrades`** — this is the subtle part. historicalTrades
+  returns _raw_ trades whose `id` is the **same id space** as the WebSocket `t`, so a backfilled
+  trade collapses onto the live one via our `(symbol, trade_id)` dedup key. aggTrades uses a
+  _different_ aggregate id that would never dedup and would corrupt counts.
+- **Idempotent by construction** — `trades` is a `ReplacingMergeTree(ingested_at)`, so re-inserting
+  a trade we already have is a no-op after merge. Paging can overlap, cycles can repeat, runs can't
+  double-count. That safety is what lets backfill be aggressive without fear.
+- **Needs an API key** — historicalTrades is a `MARKET_DATA` endpoint (key in `X-MBX-APIKEY`, no
+  request signature). Set `BINANCE_API_KEY` to enable it. With no key the service logs `disabled`
+  and idles harmlessly — `docker compose up` still works and detection still runs; only auto-healing
+  is off.
+- **Audit trail** — each cycle writes a `backfill` row into `crypto.health_checks` (value = trades
+  healed), so Grafana shows remediation right next to detection. `make gaps` prints both.
+
+Manual one-shot pass (e.g. after a known outage): **`make backfill`** (runs with `BACKFILL_ONCE=1`).
+Watch it live with `make logs-backfiller`. Tunables: `BACKFILL_INTERVAL_SECONDS`,
+`BACKFILL_WINDOW_MINUTES`, `BACKFILL_MAX_GAP`.
+
+---
+
+## Schema governance (Avro + Schema Registry)
+
+Without a registry, producer and consumer agree on the message shape **only by convention** —
+nothing stops the producer from renaming a field or changing a type and silently breaking every
+downstream reader. Messages are Avro, and the schema is an explicit, **versioned contract** held in
+[Schema Registry](schemas/trade.avsc):
+
+- **Wire format.** The producer registers the Avro schema under subject `trades-value`, the registry
+  returns an **id**, and every message carries it (Confluent wire format: magic byte + 4-byte schema
+  id + Avro payload). The consumer reads the id and fetches the **exact writer schema** from the
+  registry — so it needs **no local schema copy** and always decodes with the schema the message was
+  written with. (`make` targets and Kafka UI at :8080 → Schema Registry tab show the registered
+  versions.)
+- **Governance = enforced compatibility.** The registry is set to **BACKWARD** compatibility: a new
+  schema version may add a field _with a default_ or remove one, but may **not** add a required field
+  or change a type — a breaking change is **rejected at registration**, so it never reaches the topic.
+  That is the "schema evolution stays safe" guarantee, and it's exactly the class of bug that silently
+  corrupts a JSON pipeline.
+- **Money stays exact.** `price`/`quantity` are Avro **`string`**, not float/double — the same raw
+  decimal string Binance sends, parsed straight into ClickHouse `Decimal64(8)` at the sink. No float
+  ever touches the value, registry or not.
+- **Key unchanged.** Only the message _value_ is Avro; the key stays the plain `symbol` string, so
+  partitioning and per-symbol ordering are identical to before.
+
+The schema lives in git at [schemas/trade.avsc](schemas/trade.avsc) (canonical) and inline in the
+producer/loadgen (self-contained images); if those ever diverge incompatibly, the registry rejects the
+bad one rather than shipping it. The `backfiller` writes straight to ClickHouse (not through Kafka), so
+it's unaffected by the encoding.
 
 ---
 
 ## Benchmark (single-node)
+
+> ⚠️ The numbers below were measured with the **pre-Avro (JSON)** pipeline. Avro adds a small
+> serialize/deserialize cost on both ends (fastavro is C-accelerated, so the delta should be modest);
+> re-run `make loadtest` for exact post-Avro figures.
 
 Binance's real feed is only tens of events/sec — far too low to find the pipeline's limits.
 So `loadgen` ([loadgen/loadgen.py](loadgen/loadgen.py)) pushes **synthetic** trades (same
@@ -346,10 +432,10 @@ docker compose start producer                   # resume the real feed
 
 ```
 .
-├── docker-compose.yml          # the single orchestrator (8 services + seeder tool)
+├── docker-compose.yml          # the single orchestrator (9 services + seeder/loadgen tools)
 ├── .env.example                # documented config template (copy to .env)
 ├── .gitignore
-├── Makefile                    # up / logs / seed-peaks / dedup-check / loadtest / bench-* / clean …
+├── Makefile                    # up / logs / seed-peaks / dedup-check / backfill / loadtest / bench-* / clean …
 ├── producer/                   # Binance WS → Kafka
 │   ├── Dockerfile
 │   ├── requirements.txt
@@ -362,14 +448,20 @@ docker compose start producer                   # resume the real feed
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── seed_peaks.py
-├── healthcheck/                # scheduled freshness + per-symbol stall monitor
+├── healthcheck/                # scheduled freshness + per-symbol stall + trade-ID gap monitor
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── health_check.py
+├── backfiller/                 # self-healing: re-fetch WS-lost trades via historicalTrades
+│   ├── Dockerfile
+│   ├── requirements.txt
+│   └── backfill.py
 ├── loadgen/                    # benchmark: synthetic load at a controllable rate
 │   ├── Dockerfile
 │   ├── requirements.txt
 │   └── loadgen.py
+├── schemas/
+│   └── trade.avsc              # canonical Avro schema (the 'trades-value' contract)
 ├── clickhouse/
 │   └── init/
 │       ├── 01_schema.sql        # crypto.trades (ReplacingMergeTree, Decimal, trade_id)
@@ -419,7 +511,8 @@ Then open:
 | URL                   | What                                                                                                                                     |
 | --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
 | http://localhost:3000 | **Grafana** → **Crypto Live** · **Crypto Peak Tracking** · **Crypto Trend** · **Pipeline Health** (+ Alerting) — login `admin` / `admin` |
-| http://localhost:8080 | **Kafka UI** → cluster `crypto-local` → topic `trades`, watch messages                                                                   |
+| http://localhost:8080 | **Kafka UI** → cluster `crypto-local` → topic `trades`, watch messages · **Schema Registry** tab shows registered schemas |
+| http://localhost:8081 | **Schema Registry** REST API (e.g. `curl localhost:8081/subjects` → `["trades-value"]`)                                                   |
 
 Useful commands:
 
@@ -577,6 +670,11 @@ before exit.
    minutes → freshness goes `STALE` and the Grafana alert fires; restart → it clears. Stop one
    symbol only → that symbol flags `STALLED` while the rest stay `OK`.
 8. **Reconnect:** `docker compose restart producer` → logs show backoff → reconnect → data resumes.
+9. **Self-healing backfill** (needs `BINANCE_API_KEY`): a producer restart usually leaves a small
+   trade-ID gap → `make gaps` shows `GAP_DETECTED` with a missing count. Then `make backfill` (or wait
+   for the `backfiller` loop) → run `make gaps` again: the `backfill` row shows the healed count and the
+   next `trade_gap` check drops back to `OK`. `make logs-backfiller` shows `healing gap X-Y (N missing)`.
+   With no API key the backfiller logs `disabled` and idles — detection still works.
 
 ---
 

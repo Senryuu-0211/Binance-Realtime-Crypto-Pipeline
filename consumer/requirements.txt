@@ -3,6 +3,12 @@
 # Same Kafka client as the producer (wraps librdkafka, C).
 confluent-kafka==2.5.3
 
+# Avro + Schema Registry support for confluent-kafka's AvroDeserializer:
+#   fastavro  -> the actual Avro decoder (C-accelerated).
+#   requests  -> the SchemaRegistryClient's HTTP transport in confluent-kafka 2.5.x.
+fastavro==1.9.7
+requests==2.32.3
+
 # Official ClickHouse client (by ClickHouse Inc.). We use its column-oriented
 # batch insert: client.insert(table, rows, column_names=[...]) over HTTP (8123).
 clickhouse-connect==0.7.19

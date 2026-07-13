@@ -19,7 +19,6 @@ re-read the uncommitted messages on restart (a few duplicate rows possible —
 acceptable for Phase 1; exactly-once comes later).
 """
 
-import json
 import logging
 import os
 import signal
@@ -30,6 +29,9 @@ from decimal import Decimal, InvalidOperation
 
 import clickhouse_connect
 from confluent_kafka import Consumer
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.avro import AvroDeserializer
+from confluent_kafka.serialization import MessageField, SerializationContext
 
 # ---------------------------------------------------------------------------
 # Configuration — all from environment (see .env / docker-compose.yml).
@@ -37,6 +39,7 @@ from confluent_kafka import Consumer
 KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "kafka:9092")
 KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "trades")
 KAFKA_GROUP_ID = os.environ.get("KAFKA_GROUP_ID", "clickhouse-writer")
+SCHEMA_REGISTRY_URL = os.environ.get("SCHEMA_REGISTRY_URL", "http://schema-registry:8081")
 
 CLICKHOUSE_HOST = os.environ.get("CLICKHOUSE_HOST", "clickhouse")
 CLICKHOUSE_PORT = int(os.environ.get("CLICKHOUSE_PORT", "8123"))
@@ -77,6 +80,12 @@ log = logging.getLogger("consumer")
 
 _running = True  # flipped to False by the signal handlers for a clean exit
 
+# Set once in main(): callable that turns Confluent-wire-format Avro bytes back
+# into a dict. It fetches the exact WRITER schema from the registry by the schema
+# id embedded in each message — so the consumer needs NO local copy of the schema
+# and automatically follows the producer's registered version.
+_deserialize_value = None
+
 
 def connect_clickhouse():
     """Connect to ClickHouse, retrying until it's reachable.
@@ -109,7 +118,9 @@ def connect_clickhouse():
 def parse_message(value: bytes):
     """Turn one Kafka message into a ClickHouse row, or None if unusable.
 
-    The producer sends: {"symbol","trade_id","price"(str),"quantity"(str),"trade_time"(epoch ms)}.
+    The value is Confluent-wire-format Avro. The deserializer reads the schema id
+    off the message, fetches that exact writer schema from the registry, and hands
+    us back a dict {"symbol","trade_id","price"(str),"quantity"(str),"trade_time"(ms)}.
     - trade_id -> int (the dedup key, UInt64 column).
     - price/quantity -> Decimal built straight from Binance's STRING, so no float
       ever touches the value (exact money into the Decimal64(8) columns).
@@ -117,10 +128,10 @@ def parse_message(value: bytes):
       DateTime64(3); a raw int would be read as seconds.
     """
     try:
-        d = json.loads(value)
+        d = _deserialize_value(value, SerializationContext(KAFKA_TOPIC, MessageField.VALUE))
         trade_time = datetime.fromtimestamp(d["trade_time"] / 1000.0, tz=timezone.utc)
         return [str(d["symbol"]), int(d["trade_id"]), Decimal(d["price"]), Decimal(d["quantity"]), trade_time]
-    except (json.JSONDecodeError, KeyError, TypeError, ValueError, InvalidOperation) as exc:
+    except (KeyError, TypeError, ValueError, InvalidOperation) as exc:
         log.warning("dropping bad message: %s", exc)
         return None
 
@@ -167,6 +178,16 @@ def make_consumer() -> Consumer:
 def main() -> None:
     _install_signal_handlers()
     client = connect_clickhouse()
+
+    # Build the Avro value deserializer. Passing NO schema_str means "decode using
+    # the writer schema the registry has for each message's embedded id" — so the
+    # consumer needs no local schema file and transparently follows whatever
+    # compatible version the producer registered.
+    global _deserialize_value
+    schema_client = SchemaRegistryClient({"url": SCHEMA_REGISTRY_URL})
+    _deserialize_value = AvroDeserializer(schema_client)
+    log.info("Avro deserializer ready (schema registry %s)", SCHEMA_REGISTRY_URL)
+
     consumer = make_consumer()
     log.info("consuming '%s' as group '%s' (batch=%d, flush=%.1fs)",
              KAFKA_TOPIC, KAFKA_GROUP_ID, BATCH_SIZE, FLUSH_INTERVAL_SECONDS)

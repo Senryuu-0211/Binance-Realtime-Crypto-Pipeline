@@ -22,15 +22,45 @@ import signal
 
 import websockets
 from confluent_kafka import Producer
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.avro import AvroSerializer
+from confluent_kafka.serialization import MessageField, SerializationContext
 
 # ---------------------------------------------------------------------------
 # Configuration — all from environment (see .env / docker-compose.yml).
 # ---------------------------------------------------------------------------
 KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "kafka:9092")
 KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "trades")
+SCHEMA_REGISTRY_URL = os.environ.get("SCHEMA_REGISTRY_URL", "http://schema-registry:8081")
 BINANCE_WS_BASE = os.environ.get("BINANCE_WS_BASE", "wss://stream.binance.com:9443")
 SYMBOLS = [s.strip().upper() for s in os.environ.get("SYMBOLS", "BTCUSDT,ETHUSDT").split(",") if s.strip()]
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
+
+# Avro value schema — the CONTRACT we publish under. Canonical copy lives in
+# schemas/trade.avsc; it's inlined here so the image is self-contained. If this
+# ever drifts from a previously-registered version in a NON-backward-compatible
+# way, the Schema Registry REJECTS it at registration (it doesn't silently ship) —
+# that rejection is the whole point of having a registry. price/quantity stay
+# STRING so no float ever touches the money value (see the .avsc doc fields).
+TRADE_VALUE_SCHEMA = """
+{
+  "type": "record",
+  "name": "Trade",
+  "namespace": "crypto.trades",
+  "fields": [
+    {"name": "symbol", "type": "string"},
+    {"name": "trade_id", "type": "long"},
+    {"name": "price", "type": "string"},
+    {"name": "quantity", "type": "string"},
+    {"name": "trade_time", "type": "long"}
+  ]
+}
+"""
+
+# Set once in run(): callable that turns a trade dict into Confluent-wire-format
+# Avro bytes (magic byte + schema id + payload). Kept module-level (like STATS)
+# so publish() can reach it without threading it through every call.
+_serialize_value = None
 
 # Reconnect/backoff tuning.
 BACKOFF_BASE = 1.0     # first retry waits ~1s
@@ -124,20 +154,27 @@ def publish(producer: Producer, symbol: str, trade_id: int, price: str, quantity
     produce() is NON-BLOCKING: it copies the record into librdkafka's internal
     queue and returns. A background thread does the actual sending. If that
     queue is full it raises BufferError — we drain it with poll() and retry.
+
+    The value is serialized to Avro against the registered schema (Confluent wire
+    format). The KEY stays a plain string (symbol) so partitioning + per-symbol
+    ordering are unchanged — only the value encoding moved from JSON to Avro.
     """
-    payload = json.dumps({
-        "symbol": symbol,
-        "trade_id": trade_id,          # Binance "t" — dedup key downstream
-        "price": price,                # raw string, e.g. "64123.45000000"
-        "quantity": quantity,          # raw string
-        "trade_time": trade_time_ms,   # epoch milliseconds, as Binance sends it
-    })
+    value = _serialize_value(
+        {
+            "symbol": symbol,
+            "trade_id": trade_id,          # Binance "t" — dedup key downstream
+            "price": price,                # raw string, e.g. "64123.45000000"
+            "quantity": quantity,          # raw string
+            "trade_time": trade_time_ms,   # epoch milliseconds, as Binance sends it
+        },
+        SerializationContext(KAFKA_TOPIC, MessageField.VALUE),
+    )
     while True:
         try:
             producer.produce(
                 topic=KAFKA_TOPIC,
                 key=symbol,
-                value=payload,
+                value=value,
                 on_delivery=on_delivery,
             )
             return
@@ -223,6 +260,16 @@ async def run() -> None:
     Jitter avoids a 'thundering herd' if many clients reconnect at once.
     """
     producer = make_producer()
+
+    # Build the Avro value serializer against the Schema Registry. On its first
+    # serialize it registers TRADE_VALUE_SCHEMA under subject 'trades-value' (or
+    # reuses the existing id), then caches the id — so steady-state serialization
+    # is just a fast fastavro encode, no per-message registry call.
+    global _serialize_value
+    schema_client = SchemaRegistryClient({"url": SCHEMA_REGISTRY_URL})
+    _serialize_value = AvroSerializer(schema_client, TRADE_VALUE_SCHEMA)
+    log.info("Avro serializer ready (schema registry %s)", SCHEMA_REGISTRY_URL)
+
     stop = asyncio.Event()
     _install_signal_handlers(stop)
 

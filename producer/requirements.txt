@@ -8,3 +8,9 @@ websockets==12.0
 # producer.produce() is non-blocking (buffers + a background thread sends), so
 # it slots cleanly into our async loop without an async Kafka library.
 confluent-kafka==2.5.3
+
+# Avro + Schema Registry support for confluent-kafka's AvroSerializer:
+#   fastavro  -> the actual Avro encoder (C-accelerated).
+#   requests  -> the SchemaRegistryClient's HTTP transport in confluent-kafka 2.5.x.
+fastavro==1.9.7
+requests==2.32.3

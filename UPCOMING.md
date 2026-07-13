@@ -5,7 +5,12 @@
 > tài liệu ôn phỏng vấn.
 
 ## Trạng thái hiện tại (để tự-chứa ngữ cảnh)
-- **Phase 1–5 DONE** + **gap-detection đã thêm** (trade_id tuần tự → `health_checks` + Grafana alert).
+- **Phase 1–5 DONE** + **gap-detection đã thêm** (trade_id tuần tự → `health_checks` + Grafana alert)
+  + **REST backfill ĐÃ XONG** (service `backfiller` self-healing: quét gap ranges → `/historicalTrades?fromId=`
+  → re-insert idempotent; cần `BINANCE_API_KEY`, không có thì idle). → điểm yếu #1 đã vá.
+  + **Schema Registry + Avro ĐÃ XONG** (Phase 6): message value JSON→Avro, subject `trades-value`,
+  compatibility BACKWARD; producer/loadgen serialize, consumer deserialize từ registry (không schema local).
+  price/quantity vẫn Avro string (no float). → điểm yếu #8 (JSON thô) đã vá.
 - **Single-node** (dev laptop + Ubuntu server 48GB). Kafka KRaft RF=1, ClickHouse single node.
 - Pipeline: Binance WS → producer (`confluent-kafka`, acks=all + idempotence + flush) → Kafka
   (`trades`, 3 partition, key=symbol) → consumer group `clickhouse-writer` (at-least-once,
@@ -27,8 +32,11 @@
 ### 🔴 1. "No data loss" nhưng mất data ở mép nguồn (WS)
 - **Đòn:** *"Producer WebSocket fire-and-forget. Producer sập 30s thì trade lúc đó mất, mà còn không biết?"*
 - Kafka acks/dedup chỉ bảo vệ **bên trong** pipeline. WS không replay → mất vĩnh viễn.
-- **Trạng thái:** *detection* đã có (gap check theo trade_id tuần tự). *Remediation* (REST backfill) **chưa** → xem Backlog Tier 1.
-- **Thủ:** phân biệt "no loss bên trong" (xong) vs "no loss ở source edge" (đang làm nốt).
+- **Trạng thái:** *detection* đã có (gap check theo trade_id tuần tự) **VÀ** *remediation* đã có
+  (service `backfiller` self-heal qua `/historicalTrades`). → điểm yếu này **đã vá** — giờ là điểm MẠNH.
+- **Thủ (nay là câu chuyện tốt):** "no loss bên trong" (Kafka acks + dedup) + "no loss ở source edge"
+  (detect gap theo trade_id → backfill REST idempotent). Caveat trung thực còn lại: backfill cần API key,
+  và outage rất dài (> BACKFILL_MAX_GAP) chủ động skip (tránh runaway) — xử lý có chủ đích, không im lặng.
 
 ### 🔴 2. Single-node → câu chuyện độ bền chỉ là lý thuyết
 - **Đòn:** *"acks=all nhưng RF=1 — broker chết thì sao? acks=all lúc này = acks=1."*
@@ -66,8 +74,9 @@
   nên Float đủ (không cascade Decimal).
 
 ### ⚫ 8. Các gap "production-quality?"
-- Không test/CI · không Schema Registry (JSON thô) · không monitor infra (broker/disk/OOM/lag) ·
-  không security (no TLS/SASL, ClickHouse no-password). → xem Backlog.
+- ~~không Schema Registry (JSON thô)~~ ✅ ĐÃ VÁ (Avro + Schema Registry, BACKWARD compat).
+- Còn lại: không test/CI · không monitor infra (broker/disk/OOM/lag) · không security
+  (no TLS/SASL, ClickHouse no-password). → xem Backlog.
 
 ### ⚫ META — chiều sâu dưới áp lực
 - Nếu interviewer đào 1 nhánh bất kỳ (rebalance protocol phá at-least-once thế nào; CAP áp vào Kafka)
@@ -78,10 +87,11 @@
 # PHẦN 2 — Backlog cải thiện (đã tier-hoá + đã chỉnh)
 
 ## 🔴 Tier 1 — impact cao nhất
-1. **REST Backfill** (remediation cho gap detection). ⚠️ **Khó hơn "gọi REST":** phải dùng
-   `/api/v3/historicalTrades?fromId=` (đúng raw trade_id, **cần API key** `X-MBX-APIKEY`) — KHÔNG
-   dùng `/aggTrades` (id aggregate KHÁC, không khớp dedup key). Thêm rate-limit/phân trang. Ước ~1.5–2 ngày.
-2. **Tests + CI** (xương sống độ tin cậy, có thể coi ngang #1): unit `parse_message()` + gap/stall logic;
+1. ~~**REST Backfill**~~ ✅ **XONG** (service `backfiller`): `/api/v3/historicalTrades?fromId=` (raw
+   trade_id, `X-MBX-APIKEY`), phân trang + rate-limit (429/418/Retry-After), idempotent re-insert,
+   audit row vào `health_checks`, idle khi thiếu key. Còn có thể tô đậm khi demo: chạy `make backfill`
+   sau khi cắt producer để thấy gap → healed.
+2. **Tests + CI** ← **mục tiếp theo** (xương sống độ tin cậy, có thể coi ngang #1): unit `parse_message()` + gap/stall logic;
    integration produce→consume→verify; GitHub Actions `ruff` + `pytest` mỗi PR. ~2–3 ngày.
 
 ## 🟠 Tier 2
@@ -107,7 +117,9 @@
 14. **`docs/partition-strategy.md`** — trade-off symbol-key vs parallelism/skew; composite key cho 100+ symbol. Vũ khí đòn #5.
 
 ## ➕ Thiếu (bổ sung vào backlog)
-- **"Ai monitor healthcheck?"** dead-man switch (Prometheus `up` / Grafana no-data). Healthcheck là SPOF.
+- ~~**"Ai monitor healthcheck?"** dead-man switch~~ ✅ ĐÃ THÊM (in-stack): alert `health-monitor-heartbeat`
+  fire khi heartbeat (`max(checked_at)` của freshness) cũ > 660s. Residual SPOF: cả-host-sập cần
+  heartbeat push ra external dead-man service (Healthchecks.io/PagerDuty) — nâng cấp sau, chưa làm.
 - **Data-quality validation** lúc ingest (giá âm/0/vô lý) — năng lực DE, cầu nối sang Phase 4 anomaly.
 - **Runbook ops** (reset offset, recover, replay) — gộp vào docs.
 
@@ -116,8 +128,8 @@
 # PHẦN 3 — Meta strategy (quan trọng nhất)
 - Ưu tiên theo **ROI-phỏng-vấn / giờ**, KHÔNG theo "impact lên hệ thống":
   - **Rẻ + ROI cao (làm ngay ~1–1.5 ngày):** lag alert, HA doc, partition-key doc, ClickHouse password, TTL, graceful-shutdown.
-  - **Đắt + đáng:** Tests+CI, REST backfill, Prometheus stack.
-  - **Đắt + tuỳ thời gian:** Schema Registry (nặng nhất — cân nhắc hiểu-sâu+demo-nhỏ thay vì full Avro migration), DLQ.
+  - **Đắt + đáng:** Tests+CI, ~~REST backfill~~ ✅, Prometheus stack.
+  - **Đắt + tuỳ thời gian:** ~~Schema Registry~~ ✅ **ĐÃ LÀM full Avro migration** (Phase 6), DLQ.
 - ⚠️ **Đừng để backlog thành hố scope-creep khiến mãi không đi phỏng vấn.** Portfolio có diminishing returns.
   Một project *"đủ tốt + defensible + hiểu sâu"* + **đã apply** > project *"hoàn hảo + chưa nộp đơn"*.
   Mục tiêu là **cái job**, không phải repo 10/10.

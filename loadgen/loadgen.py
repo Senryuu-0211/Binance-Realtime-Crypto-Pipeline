@@ -19,17 +19,38 @@ Methodology baked into the design (this is what makes the numbers honest):
     consumer -> ClickHouse path; we're not testing producer delivery guarantees.
 """
 
-import json
 import logging
 import os
 import random
 import time
 
 from confluent_kafka import Producer
+from confluent_kafka.schema_registry import SchemaRegistryClient
+from confluent_kafka.schema_registry.avro import AvroSerializer
+from confluent_kafka.serialization import MessageField, SerializationContext
 
 KAFKA_BROKER = os.environ.get("KAFKA_BROKER", "kafka:9092")
 KAFKA_TOPIC = os.environ.get("KAFKA_TOPIC", "trades")
+SCHEMA_REGISTRY_URL = os.environ.get("SCHEMA_REGISTRY_URL", "http://schema-registry:8081")
 SYMBOLS = [s.strip().upper() for s in os.environ.get("SYMBOLS", "BTCUSDT,ETHUSDT,BNBUSDT,XRPUSDT,SOLUSDT").split(",") if s.strip()]
+
+# Must match the producer's schema exactly — loadgen writes to the SAME topic, so
+# it serializes under the same registered 'trades-value' subject. (Canonical copy:
+# schemas/trade.avsc.)
+TRADE_VALUE_SCHEMA = """
+{
+  "type": "record",
+  "name": "Trade",
+  "namespace": "crypto.trades",
+  "fields": [
+    {"name": "symbol", "type": "string"},
+    {"name": "trade_id", "type": "long"},
+    {"name": "price", "type": "string"},
+    {"name": "quantity", "type": "string"},
+    {"name": "trade_time", "type": "long"}
+  ]
+}
+"""
 
 RATE = float(os.environ.get("LOADTEST_RATE", "10000"))        # target events/sec
 DURATION = float(os.environ.get("LOADTEST_DURATION", "60"))   # seconds to run
@@ -68,6 +89,10 @@ def make_producer() -> Producer:
 
 def main() -> None:
     producer = make_producer()
+    # Avro-encode like the real producer (same schema, same 'trades-value' subject),
+    # so synthetic load exercises the real serialization + deserialization path.
+    schema_client = SchemaRegistryClient({"url": SCHEMA_REGISTRY_URL})
+    serialize = AvroSerializer(schema_client, TRADE_VALUE_SCHEMA)
     n_symbols = len(SYMBOLS)
     # Unique, monotonic base so this run's ids never collide with real trades or a
     # previous run (UInt64 has ample room: ~1.75e9 * 1e8 << 1.8e19). The INSTANCE
@@ -96,13 +121,16 @@ def main() -> None:
             base = BASE_PRICES.get(sym, 100.0)
             # In dup mode, reuse a tiny id space so ReplacingMergeTree collapses them.
             tid = (base_id + (sent % 1000)) if DUP_MODE else (base_id + sent)
-            payload = json.dumps({
-                "symbol": sym,
-                "trade_id": tid,
-                "price": f"{base * (1 + random.uniform(-0.0015, 0.0015)):.8f}",
-                "quantity": f"{random.uniform(0.0001, 3.0):.8f}",
-                "trade_time": now_ms,            # stamped at publish = latency clock start
-            })
+            payload = serialize(
+                {
+                    "symbol": sym,
+                    "trade_id": tid,
+                    "price": f"{base * (1 + random.uniform(-0.0015, 0.0015)):.8f}",
+                    "quantity": f"{random.uniform(0.0001, 3.0):.8f}",
+                    "trade_time": now_ms,        # stamped at publish = latency clock start
+                },
+                SerializationContext(KAFKA_TOPIC, MessageField.VALUE),
+            )
             try:
                 producer.produce(KAFKA_TOPIC, key=sym, value=payload)
                 sent += 1
